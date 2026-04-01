@@ -1,0 +1,375 @@
+#
+# SQLite MessagePack Extension — Test Suite
+# Run: cd /path/to/sqlite && ./sqlite3 :memory: < test/msgpack01.test
+#
+
+.load ext/msgpack/msgpack
+.mode table
+
+-- ===== PHASE 1: Validation & Quote =====
+
+SELECT '1.1 nil encoding' AS test,
+  hex(msgpack_quote(null)) AS result,
+  'C0' AS expected;
+
+SELECT '1.2 positive fixint' AS test,
+  hex(msgpack_quote(42)) AS result,
+  '2A' AS expected;
+
+SELECT '1.3 negative fixint' AS test,
+  hex(msgpack_quote(-1)) AS result,
+  'FF' AS expected;
+
+SELECT '1.4 uint8' AS test,
+  hex(msgpack_quote(255)) AS result,
+  'CCFF' AS expected;
+
+SELECT '1.5 int16 negative' AS test,
+  hex(msgpack_quote(-200)) AS result,
+  'D1FF38' AS expected;
+
+SELECT '1.6 float64' AS test,
+  msgpack_valid(msgpack_quote(3.14)) AS result,
+  1 AS expected;
+
+SELECT '1.7 fixstr hello' AS test,
+  hex(msgpack_quote('hello')) AS result,
+  'A568656C6C6F' AS expected;
+
+SELECT '1.8 bin type for raw blob' AS test,
+  msgpack_type(msgpack_object('k', x'DEAD'), '$.k') AS result,
+  'blob' AS expected;
+
+SELECT '1.9 valid returns 1' AS test,
+  msgpack_valid(msgpack_quote(99)) AS result,
+  1 AS expected;
+
+SELECT '1.10 non-blob returns 0' AS test,
+  msgpack_valid('not msgpack') AS result,
+  0 AS expected;
+
+SELECT '1.11 empty blob is invalid' AS test,
+  msgpack_valid(x'') AS result,
+  0 AS expected;
+
+SELECT '1.12 0xc1 is illegal' AS test,
+  msgpack_valid(x'c1') AS result,
+  0 AS expected;
+
+-- ===== PHASE 2: Construction =====
+
+SELECT '2.1 empty array' AS test,
+  hex(msgpack_array()) AS result,
+  '90' AS expected;
+
+SELECT '2.2 fixarray [1,2,3]' AS test,
+  hex(msgpack_array(1,2,3)) AS result,
+  '93010203' AS expected;
+
+SELECT '2.3 array is valid' AS test,
+  msgpack_valid(msgpack_array(1,'hi',null,3.14)) AS result,
+  1 AS expected;
+
+SELECT '2.4 empty map' AS test,
+  hex(msgpack_object()) AS result,
+  '80' AS expected;
+
+SELECT '2.5 fixmap {a:1,b:2}' AS test,
+  hex(msgpack_object('a',1,'b',2)) AS result,
+  '82A16101A16202' AS expected;
+
+SELECT '2.6 array length' AS test,
+  msgpack_array_length(msgpack_array(10,20,30)) AS result,
+  3 AS expected;
+
+SELECT '2.7 map pair count' AS test,
+  msgpack_array_length(msgpack_object('x',1,'y',2)) AS result,
+  2 AS expected;
+
+SELECT '2.8 nested blob auto-embedding' AS test,
+  msgpack_type(msgpack_object('t', msgpack_array(1,2)), '$.t') AS result,
+  'array' AS expected;
+
+SELECT '2.9 msgpack() validates' AS test,
+  msgpack_valid(msgpack(msgpack_array(1,2,3))) AS result,
+  1 AS expected;
+
+-- ===== PHASE 3: Extraction =====
+
+SELECT '3.1 extract array index' AS test,
+  msgpack_extract(msgpack_array(10,20,30), '$[1]') AS result,
+  20 AS expected;
+
+SELECT '3.2 extract map key' AS test,
+  msgpack_extract(msgpack_object('a',1,'b',99), '$.b') AS result,
+  99 AS expected;
+
+SELECT '3.3 missing key returns null' AS test,
+  msgpack_extract(msgpack_object('a',1), '$.z') IS NULL AS result,
+  1 AS expected;
+
+SELECT '3.4 oob index returns null' AS test,
+  msgpack_extract(msgpack_array(1,2,3), '$[9]') IS NULL AS result,
+  1 AS expected;
+
+SELECT '3.5 nested extract' AS test,
+  msgpack_extract(msgpack_object('x', msgpack_array(5,6,7)), '$.x[2]') AS result,
+  7 AS expected;
+
+SELECT '3.6 deep nested' AS test,
+  msgpack_extract(
+    msgpack_object('a', msgpack_object('b', 42)),
+    '$.a.b') AS result,
+  42 AS expected;
+
+SELECT '3.7 multi-path returns array' AS test,
+  msgpack_type(
+    msgpack_extract(msgpack_object('a',1,'b',2,'c',3), '$.a','$.c')
+  ) AS result,
+  'array' AS expected;
+
+SELECT '3.8 type: null'    AS test, msgpack_type(msgpack_quote(null))  AS result, 'null'    AS expected;
+SELECT '3.9 type: true'    AS test, msgpack_type(msgpack_quote(1=1))   AS result, 'integer' AS expected;
+SELECT '3.10 type: integer' AS test, msgpack_type(msgpack_quote(42))   AS result, 'integer' AS expected;
+SELECT '3.11 type: real'    AS test, msgpack_type(msgpack_quote(1.5))  AS result, 'real'    AS expected;
+SELECT '3.12 type: text'    AS test, msgpack_type(msgpack_quote('hi')) AS result, 'text'    AS expected;
+SELECT '3.13 type: array'   AS test, msgpack_type(msgpack_array(1,2))  AS result, 'array'   AS expected;
+SELECT '3.14 type: map'     AS test, msgpack_type(msgpack_object('k','v')) AS result, 'map' AS expected;
+
+SELECT '3.15 array_length null for scalar' AS test,
+  msgpack_array_length(msgpack_quote(42)) IS NULL AS result,
+  1 AS expected;
+
+SELECT '3.16 error_position valid=0' AS test,
+  msgpack_error_position(msgpack_array(1,2,3)) AS result,
+  0 AS expected;
+
+SELECT '3.17 error_position truncated' AS test,
+  msgpack_error_position(x'92') > 0 AS result,
+  1 AS expected;
+
+-- ===== PHASE 4: Mutation =====
+
+SELECT '4.1 set existing key' AS test,
+  msgpack_extract(msgpack_set(msgpack_object('x',1), '$.x', 99), '$.x') AS result,
+  99 AS expected;
+
+SELECT '4.2 set new key' AS test,
+  msgpack_extract(msgpack_set(msgpack_object('a',1), '$.b', 42), '$.b') AS result,
+  42 AS expected;
+
+SELECT '4.3 set array element' AS test,
+  msgpack_extract(msgpack_set(msgpack_array(1,2,3), '$[0]', 99), '$[0]') AS result,
+  99 AS expected;
+
+SELECT '4.4 insert absent key creates it' AS test,
+  msgpack_extract(msgpack_insert(msgpack_object('a',1), '$.b', 9), '$.b') AS result,
+  9 AS expected;
+
+SELECT '4.5 insert existing key is no-op' AS test,
+  msgpack_extract(msgpack_insert(msgpack_object('a',1), '$.a', 99), '$.a') AS result,
+  1 AS expected;
+
+SELECT '4.6 replace existing' AS test,
+  msgpack_extract(msgpack_replace(msgpack_object('x',5), '$.x', 50), '$.x') AS result,
+  50 AS expected;
+
+SELECT '4.7 replace missing is no-op (count unchanged)' AS test,
+  msgpack_array_length(msgpack_replace(msgpack_object('x',5), '$.y', 50)) AS result,
+  1 AS expected;
+
+SELECT '4.8 remove map key' AS test,
+  msgpack_array_length(msgpack_remove(msgpack_object('a',1,'b',2), '$.a')) AS result,
+  1 AS expected;
+
+SELECT '4.9 remove array element' AS test,
+  msgpack_extract(msgpack_remove(msgpack_array(10,20,30), '$[0]'), '$[0]') AS result,
+  20 AS expected;
+
+SELECT '4.10 remove multiple paths' AS test,
+  msgpack_array_length(msgpack_remove(
+    msgpack_object('a',1,'b',2,'c',3), '$.a','$.b')) AS result,
+  1 AS expected;
+
+SELECT '4.11 array_insert before index' AS test,
+  msgpack_extract(msgpack_array_insert(msgpack_array(10,20,30),'$[1]',99),'$[1]') AS result,
+  99 AS expected;
+
+SELECT '4.12 array_insert increases length' AS test,
+  msgpack_array_length(msgpack_array_insert(msgpack_array(10,20,30),'$[1]',99)) AS result,
+  4 AS expected;
+
+SELECT '4.13 patch update+add' AS test,
+  msgpack_extract(msgpack_patch(
+    msgpack_object('a',1,'b',2),
+    msgpack_object('b',20,'c',30)
+  ), '$.b') AS result,
+  20 AS expected;
+
+SELECT '4.14 patch nil removes key' AS test,
+  msgpack_extract(msgpack_patch(
+    msgpack_object('a',1,'b',2),
+    msgpack_object('b',null)
+  ), '$.b') IS NULL AS result,
+  1 AS expected;
+
+SELECT '4.15 multi-set chain' AS test,
+  msgpack_extract(
+    msgpack_set(msgpack_object('a',1,'b',2), '$.a',10,'$.b',20), '$.a'
+  ) AS result,
+  10 AS expected;
+
+-- ===== PHASE 5: Conversion =====
+
+SELECT '5.1 null roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('null')) AS result,
+  'null' AS expected;
+
+SELECT '5.2 integer roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('42')) AS result,
+  '42' AS expected;
+
+SELECT '5.3 negative roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('-7')) AS result,
+  '-7' AS expected;
+
+SELECT '5.4 string roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('"hello"')) AS result,
+  '"hello"' AS expected;
+
+SELECT '5.5 array roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('[1,2,3]')) AS result,
+  '[1,2,3]' AS expected;
+
+SELECT '5.6 object roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('{"a":1,"b":2}')) AS result,
+  '{"a":1,"b":2}' AS expected;
+
+SELECT '5.7 nested roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('{"name":"Alice","scores":[90,85,92]}'))
+    AS result,
+  '{"name":"Alice","scores":[90,85,92]}' AS expected;
+
+SELECT '5.8 from_json null keyword' AS test,
+  hex(msgpack_from_json('null')) AS result,
+  'C0' AS expected;
+
+SELECT '5.9 from_json array bytes' AS test,
+  hex(msgpack_from_json('[1,2,3]')) AS result,
+  '93010203' AS expected;
+
+SELECT '5.10 from_json object bytes' AS test,
+  hex(msgpack_from_json('{"a":1}')) AS result,
+  '81A16101' AS expected;
+
+SELECT '5.11 string escape roundtrip' AS test,
+  msgpack_to_json(msgpack_from_json('"line1\nline2"')) AS result,
+  '"line1\nline2"' AS expected;
+
+SELECT '5.12 pretty outputs newlines' AS test,
+  instr(msgpack_pretty(msgpack_from_json('{"a":1}')), char(10)) > 0 AS result,
+  1 AS expected;
+
+-- ===== PHASE 6: Aggregates =====
+
+SELECT '6.1 group_array integers' AS test,
+  msgpack_to_json(msgpack_group_array(x)) AS result,
+  '[1,2,3]' AS expected
+FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3);
+
+SELECT '6.2 group_array strings' AS test,
+  msgpack_to_json(msgpack_group_array(v)) AS result,
+  '["a","b","c"]' AS expected
+FROM (SELECT 'a' AS v UNION ALL SELECT 'b' UNION ALL SELECT 'c');
+
+SELECT '6.3 group_object' AS test,
+  msgpack_to_json(msgpack_group_object(k,v)) AS result,
+  '{"a":1,"b":2}' AS expected
+FROM (SELECT 'a' AS k, 1 AS v UNION ALL SELECT 'b', 2);
+
+SELECT '6.4 group_array with GROUP BY sensor A' AS test,
+  (SELECT msgpack_to_json(msgpack_group_array(val))
+   FROM (SELECT 'A' AS sensor, 10 AS val
+         UNION ALL SELECT 'A', 20)
+   WHERE sensor='A') AS result,
+  '[10,20]' AS expected;
+
+SELECT '6.5 group_array result is valid msgpack' AS test,
+  msgpack_valid(msgpack_group_array(x)) AS result,
+  1 AS expected
+FROM (SELECT 1 AS x UNION ALL SELECT 2);
+
+-- ===== PHASE 7: Table-Valued Functions =====
+
+SELECT '7.1 each array row count' AS test,
+  count(*) AS result,
+  3 AS expected
+FROM msgpack_each(msgpack_array(10,20,30));
+
+SELECT '7.2 each array keys are integers' AS test,
+  min(key) AS result,
+  0 AS expected
+FROM msgpack_each(msgpack_array(10,20,30));
+
+SELECT '7.3 each array values' AS test,
+  sum(value) AS result,
+  60 AS expected
+FROM msgpack_each(msgpack_array(10,20,30));
+
+SELECT '7.4 each object row count' AS test,
+  count(*) AS result,
+  2 AS expected
+FROM msgpack_each(msgpack_object('a',1,'b',2));
+
+SELECT '7.5 each object fullkeys' AS test,
+  group_concat(fullkey ORDER BY fullkey) AS result,
+  '$.a,$.b' AS expected
+FROM msgpack_each(msgpack_object('a',1,'b',2));
+
+SELECT '7.6 each does NOT recurse into nested' AS test,
+  count(*) AS result,
+  2 AS expected
+FROM msgpack_each(msgpack_object('x',1,'y',msgpack_array(1,2,3)));
+
+SELECT '7.7 each with root path' AS test,
+  count(*) AS result,
+  3 AS expected
+FROM msgpack_each(msgpack_object('tags',msgpack_array('a','b','c')), '$.tags');
+
+SELECT '7.8 tree includes root' AS test,
+  count(*) AS result,
+  5 AS expected
+FROM msgpack_tree(msgpack_array(10,msgpack_array(20,30)));
+
+SELECT '7.9 tree root key is null' AS test,
+  key IS NULL AS result,
+  1 AS expected
+FROM msgpack_tree(msgpack_array(1,2)) WHERE id=0;
+
+SELECT '7.10 tree fullkeys' AS test,
+  group_concat(fullkey ORDER BY fullkey) AS result,
+  '$,$[0],$[1],$[1][0],$[1][1]' AS expected
+FROM msgpack_tree(msgpack_array(10,msgpack_array(20,30)));
+
+SELECT '7.11 tree parent of child' AS test,
+  parent AS result,
+  0 AS expected
+FROM msgpack_tree(msgpack_array(1,2)) WHERE key=0;
+
+SELECT '7.12 each path column' AS test,
+  path AS result,
+  '$' AS expected
+FROM msgpack_each(msgpack_array(1,2)) LIMIT 1;
+
+SELECT '7.13 atom null for containers' AS test,
+  atom IS NULL AS result,
+  1 AS expected
+FROM msgpack_tree(msgpack_array(1,msgpack_array(2,3))) WHERE type='array' AND key IS NOT NULL;
+
+SELECT '7.14 atom equals value for scalars' AS test,
+  atom = value AS result,
+  1 AS expected
+FROM msgpack_each(msgpack_array(42)) WHERE key=0;
+
+.print ''
+.print 'All tests complete.'
