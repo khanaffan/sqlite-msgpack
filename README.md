@@ -1,3 +1,5 @@
+<img src="docs/repo.png" width="400" alt="Repository overview">
+
 # sqlite-msgpack
 
 [![CI](https://github.com/khanaffan/sqlite-msgpack/actions/workflows/ci.yml/badge.svg)](https://github.com/khanaffan/sqlite-msgpack/actions/workflows/ci.yml)
