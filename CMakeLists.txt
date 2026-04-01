@@ -9,10 +9,12 @@ option(MSGPACK_BUILD_TESTS "Build and register CTest tests" ON)
 # Suppress MSVC warnings about POSIX names and use of standard C library functions
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
-    # Build with C11 mode (MSVC 19.28+ supports /std:c11)
     add_compile_options(/W3)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    # Apply only basic warnings globally; -Wpedantic is intentionally omitted
+    # because the bundled SQLite amalgamation and shell trigger pedantic warnings
+    # (string-length limits, extra semicolons) that are not ours to fix.
+    add_compile_options(-Wall -Wextra)
 endif()
 
 # ── Platform-specific link libraries helper ───────────────────────────────────
@@ -35,6 +37,10 @@ target_compile_definitions(sqlite3_amalg PUBLIC
     SQLITE_ENABLE_JSON1
     SQLITE_ENABLE_LOAD_EXTENSION=1
 )
+# Suppress warnings from third-party SQLite source we don't control
+if(NOT MSVC)
+    target_compile_options(sqlite3_amalg PRIVATE -w)
+endif()
 set_target_properties(sqlite3_amalg PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_platform_libs(sqlite3_amalg PUBLIC)
 
@@ -81,13 +87,11 @@ target_compile_definitions(sqlite3_cli PRIVATE
     SQLITE_ENABLE_JSON1
     SQLITE_ENABLE_LOAD_EXTENSION=1
 )
-target_platform_libs(sqlite3_cli PRIVATE)
-# Windows: the CLI uses _isatty / _fileno
-if(WIN32)
-    target_compile_definitions(sqlite3_cli PRIVATE
-        SQLITE_OS_WIN=1
-    )
+# Suppress warnings from third-party SQLite source we don't control
+if(NOT MSVC)
+    target_compile_options(sqlite3_cli PRIVATE -w)
 endif()
+target_platform_libs(sqlite3_cli PRIVATE)
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(MSGPACK_BUILD_TESTS)

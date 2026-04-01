@@ -20,6 +20,7 @@
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
+#include <stdint.h>
 #include <string.h>
 #include <assert.h>
 #include <math.h>
