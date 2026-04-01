@@ -155,6 +155,14 @@ Each MessagePack element has a type string returned by `msgpack_type()`:
 
 ### Encoding & validation
 
+#### `msgpack_version()`
+
+Returns the extension version string.
+
+```sql
+SELECT msgpack_version();  -- '1.0.0'
+```
+
 #### `msgpack_quote(value)`
 
 Encodes a single SQL value as a msgpack BLOB using the smallest valid format:

@@ -20,6 +20,9 @@
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
+#define SQLITE_MSGPACK_VERSION       "1.0.0"
+#define SQLITE_MSGPACK_VERSION_NUMBER 1000000  /* major*1000000 + minor*1000 + patch */
+
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
@@ -2448,6 +2451,15 @@ static sqlite3_module mpVtabModule = {
   0,0,0,0,0,0,0,0,0,0,0
 };
 
+/* ── msgpack_version() ───────────────────────────────────────────────────── */
+
+static void msgpackVersionFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  (void)argc; (void)argv;
+  sqlite3_result_text(ctx, SQLITE_MSGPACK_VERSION, -1, SQLITE_STATIC);
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #elif defined(__GNUC__)
@@ -2590,6 +2602,12 @@ int sqlite3_msgpack_init(
   if( rc ) return rc;
   rc = sqlite3_create_module_v2(db, "msgpack_tree", &mpVtabModule,
          (void*)1, 0);
+  if( rc ) return rc;
+
+  /* Version scalar */
+  rc = sqlite3_create_function_v2(db, "msgpack_version", 0,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackVersionFunc, 0, 0, 0);
   if( rc ) return rc;
 
   return SQLITE_OK;
