@@ -748,6 +748,7 @@ static void mpReturnElement(
         sLen = mpRead32(a+iStart+1); sOff = iStart+5;
       }
       if( sOff ){
+        if( sLen > n-sOff ) sLen = n-sOff;
         sqlite3_result_text(ctx, (const char*)(a+sOff), (int)sLen,
                             SQLITE_TRANSIENT);
         return;
@@ -1692,7 +1693,11 @@ static void mpToJsonAt(
     else if(b==MP_STR8 &&i+2<=n){ sLen=a[i+1]; sOff=i+2; }
     else if(b==MP_STR16&&i+3<=n){ sLen=mpRead16(a+i+1); sOff=i+3; }
     else if(b==MP_STR32&&i+5<=n){ sLen=mpRead32(a+i+1); sOff=i+5; }
-    if( sOff ){ mpJsonEscapeStr(out, a+sOff, sLen); return; }
+    if( sOff ){
+      if( sLen > n-sOff ) sLen = n-sOff;
+      mpJsonEscapeStr(out, a+sOff, sLen);
+      return;
+    }
   }
 
   /* bin → hex string */
@@ -1703,6 +1708,7 @@ static void mpToJsonAt(
     if( bOff ){
       static const char hex[]="0123456789abcdef";
       u32 j;
+      if( bLen > n-bOff ) bLen = n-bOff;
       mpBufAppend1(out,'"');
       for(j=0; j<bLen; j++){
         u8 by=a[bOff+j];
@@ -1723,6 +1729,7 @@ static void mpToJsonAt(
       u32 cur=dataOff, j;
       mpBufAppend1(out,'[');
       for(j=0; j<count; j++){
+        if( cur >= n ) break;
         u32 next=mpSkipOne(a,n,cur);
         if(j>0) mpBufAppend1(out,',');
         if(pretty) mpJsonNewline(out,depth+1,indentW);
@@ -1744,6 +1751,7 @@ static void mpToJsonAt(
       u32 cur=dataOff, j;
       mpBufAppend1(out,'{');
       for(j=0; j<count; j++){
+        if( cur >= n ) break;
         u32 valOff=mpSkipOne(a,n,cur);
         u32 pairEnd=valOff?mpSkipOne(a,n,valOff):0;
         if(j>0) mpBufAppend1(out,',');
