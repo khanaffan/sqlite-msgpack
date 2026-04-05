@@ -20,8 +20,8 @@
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
-#define SQLITE_MSGPACK_VERSION       "1.0.0"
-#define SQLITE_MSGPACK_VERSION_NUMBER 1000000  /* major*1000000 + minor*1000 + patch */
+#define SQLITE_MSGPACK_VERSION       "1.0.1"
+#define SQLITE_MSGPACK_VERSION_NUMBER 1000001  /* major*1000000 + minor*1000 + patch */
 
 #include <stdint.h>
 #include <string.h>

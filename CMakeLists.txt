@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sqlite_msgpack VERSION 1.0.0 LANGUAGES C)
+project(sqlite_msgpack VERSION 1.0.1 LANGUAGES C)
 
 # ── Options ──────────────────────────────────────────────────────────────────
 option(BUILD_SHARED_LIBS "Build msgpack as a loadable extension (.so/.dylib/.dll)" ON)
