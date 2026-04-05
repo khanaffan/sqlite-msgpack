@@ -136,6 +136,21 @@ if(MSGPACK_BUILD_TESTS)
 
 endif()
 
+# ── Fuzz testing (requires Clang with libFuzzer support) ──────────────────────
+option(MSGPACK_BUILD_FUZZ "Build libFuzzer-based fuzz harness" OFF)
+
+if(MSGPACK_BUILD_FUZZ)
+    # Apply sanitizer flags to all targets so coverage instrumentation
+    # reaches into msgpack and sqlite3 code, not just the harness.
+    add_executable(fuzz_msgpack tests/fuzz_msgpack.c src/msgpack.c src/sqlite3.c)
+    target_include_directories(fuzz_msgpack PRIVATE include)
+    target_compile_definitions(fuzz_msgpack PRIVATE SQLITE_CORE
+        SQLITE_THREADSAFE=1 SQLITE_ENABLE_JSON1 SQLITE_ENABLE_LOAD_EXTENSION=1)
+    target_platform_libs(fuzz_msgpack PRIVATE)
+    target_compile_options(fuzz_msgpack PRIVATE -fsanitize=fuzzer,address -g)
+    target_link_options(fuzz_msgpack PRIVATE -fsanitize=fuzzer,address)
+endif()
+
 # ── Install headers ───────────────────────────────────────────────────────────
 install(FILES include/sqlite3.h include/sqlite3ext.h DESTINATION include)
 

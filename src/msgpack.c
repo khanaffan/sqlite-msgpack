@@ -36,6 +36,12 @@ typedef unsigned int   u32;
 typedef sqlite3_int64  i64;
 typedef sqlite3_uint64 u64;
 
+/* Maximum nesting depth for recursive operations (JSON conversion, merge-patch) */
+#define MP_MAX_DEPTH 200
+
+/* Maximum output buffer size to prevent runaway allocation on malformed input */
+#define MP_MAX_OUTPUT (64*1024*1024)
+
 /*
 ** MessagePack format constants
 */
@@ -140,6 +146,11 @@ static int mpBufGrow(MpBuf *p, u32 nNeeded){
   u32 nNew;
   u8 *aNew;
   if( p->bErr ) return 0;
+  if( nNeeded > MP_MAX_OUTPUT ){
+    p->bErr = 1;
+    if(p->pCtx) sqlite3_result_error(p->pCtx, "msgpack output too large", -1);
+    return 0;
+  }
   nNew = p->nAlloc;
   while( nNew < nNeeded ) nNew *= 2;
   if( p->aBuf == p->aSpace ){
@@ -157,7 +168,8 @@ static int mpBufGrow(MpBuf *p, u32 nNeeded){
 
 static void mpBufAppend(MpBuf *p, const u8 *pData, u32 n){
   if( p->bErr ) return;
-  if( p->nUsed + n > p->nAlloc ){
+  if( n > MP_MAX_OUTPUT - p->nUsed ){ p->bErr=1; return; }
+  if( n > p->nAlloc - p->nUsed ){
     if( !mpBufGrow(p, p->nUsed + n) ) return;
   }
   memcpy(p->aBuf + p->nUsed, pData, n);
@@ -166,6 +178,7 @@ static void mpBufAppend(MpBuf *p, const u8 *pData, u32 n){
 
 static void mpBufAppend1(MpBuf *p, u8 b){
   if( p->bErr ) return;
+  if( p->nUsed >= MP_MAX_OUTPUT ){ p->bErr=1; return; }
   if( p->nUsed + 1 > p->nAlloc ){
     if( !mpBufGrow(p, p->nUsed + 1) ) return;
   }
@@ -176,7 +189,8 @@ static void mpBufAppend1(MpBuf *p, u8 b){
 static u8 *mpBufReserve(MpBuf *p, u32 n){
   u8 *ret;
   if( p->bErr ) return 0;
-  if( p->nUsed + n > p->nAlloc ){
+  if( n > MP_MAX_OUTPUT - p->nUsed ){ p->bErr=1; return 0; }
+  if( n > p->nAlloc - p->nUsed ){
     if( !mpBufGrow(p, p->nUsed + n) ) return 0;
   }
   ret = p->aBuf + p->nUsed;
@@ -343,24 +357,24 @@ static u32 mpSkipOne(const u8 *a, u32 n, u32 i){
     /* bin */
     case MP_BIN8:
       if( i+1 > n ) return 0;
-      { u32 sz = a[i]; i++; return (i+sz<=n)?i+sz:0; }
+      { u32 sz = a[i]; i++; return (sz<=n-i)?i+sz:0; }
     case MP_BIN16:
       if( i+2 > n ) return 0;
-      { u32 sz = mpRead16(a+i); i+=2; return (i+sz<=n)?i+sz:0; }
+      { u32 sz = mpRead16(a+i); i+=2; return (sz<=n-i)?i+sz:0; }
     case MP_BIN32:
       if( i+4 > n ) return 0;
-      { u32 sz = mpRead32(a+i); i+=4; return (i+sz<=n)?i+sz:0; }
+      { u32 sz = mpRead32(a+i); i+=4; return (sz<=n-i)?i+sz:0; }
 
     /* str */
     case MP_STR8:
       if( i+1 > n ) return 0;
-      { u32 sz = a[i]; i++; return (i+sz<=n)?i+sz:0; }
+      { u32 sz = a[i]; i++; return (sz<=n-i)?i+sz:0; }
     case MP_STR16:
       if( i+2 > n ) return 0;
-      { u32 sz = mpRead16(a+i); i+=2; return (i+sz<=n)?i+sz:0; }
+      { u32 sz = mpRead16(a+i); i+=2; return (sz<=n-i)?i+sz:0; }
     case MP_STR32:
       if( i+4 > n ) return 0;
-      { u32 sz = mpRead32(a+i); i+=4; return (i+sz<=n)?i+sz:0; }
+      { u32 sz = mpRead32(a+i); i+=4; return (sz<=n-i)?i+sz:0; }
 
     /* fixext */
     case MP_FIXEXT1:  return (i+2<=n)?i+2:0;
@@ -371,14 +385,14 @@ static u32 mpSkipOne(const u8 *a, u32 n, u32 i){
 
     /* ext */
     case MP_EXT8:
-      if( i+1 > n ) return 0;
-      { u32 sz = a[i]; i+=2; return (i+sz<=n)?i+sz:0; } /* skip type byte */
-    case MP_EXT16:
       if( i+2 > n ) return 0;
-      { u32 sz = mpRead16(a+i); i+=3; return (i+sz<=n)?i+sz:0; }
+      { u32 sz = a[i]; i+=2; return (sz<=n-i)?i+sz:0; } /* skip type byte */
+    case MP_EXT16:
+      if( i+3 > n ) return 0;
+      { u32 sz = mpRead16(a+i); i+=3; return (sz<=n-i)?i+sz:0; }
     case MP_EXT32:
-      if( i+4 > n ) return 0;
-      { u32 sz = mpRead32(a+i); i+=5; return (i+sz<=n)?i+sz:0; }
+      if( i+5 > n ) return 0;
+      { u32 sz = mpRead32(a+i); i+=5; return (sz<=n-i)?i+sz:0; }
 
     /* array16 */
     case MP_ARRAY16:
@@ -748,6 +762,7 @@ static void mpReturnElement(
         sLen = mpRead32(a+iStart+1); sOff = iStart+5;
       }
       if( sOff ){
+        if( sLen > n-sOff ) sLen = n-sOff;
         sqlite3_result_text(ctx, (const char*)(a+sOff), (int)sLen,
                             SQLITE_TRANSIENT);
         return;
@@ -1136,15 +1151,18 @@ static void msgpackRemoveFunc(
 static int mpMergePatch(
   MpBuf *out,
   const u8 *a, u32 n,  u32 ia,   /* target element */
-  const u8 *p, u32 np, u32 ip    /* patch element */
+  const u8 *p, u32 np, u32 ip,   /* patch element */
+  int depth
 );
 
 static int mpMergePatch(
   MpBuf *out,
   const u8 *a, u32 n,  u32 ia,
-  const u8 *p, u32 np, u32 ip
+  const u8 *p, u32 np, u32 ip,
+  int depth
 ){
   if(ip>=np) return SQLITE_ERROR;
+  if(depth>MP_MAX_DEPTH) return SQLITE_ERROR;
   u8 pb = p[ip];
 
   /* If patch is nil → result is nil */
@@ -1164,14 +1182,24 @@ static int mpMergePatch(
 
   u32 pCount,pDataOff;
   if(pb>=0x80&&pb<=0x8f)     { pCount=pb&0x0f;           pDataOff=ip+1; }
-  else if(pb==MP_MAP16)       { pCount=mpRead16(p+ip+1);  pDataOff=ip+3; }
-  else                        { pCount=mpRead32(p+ip+1);  pDataOff=ip+5; }
+  else if(pb==MP_MAP16){
+    if(ip+3>np) return SQLITE_ERROR;
+    pCount=mpRead16(p+ip+1);  pDataOff=ip+3;
+  } else {
+    if(ip+5>np) return SQLITE_ERROR;
+    pCount=mpRead32(p+ip+1);  pDataOff=ip+5;
+  }
 
   u32 aCount=0, aDataOff=0;
   if(aIsMap){
     if(ab>=0x80&&ab<=0x8f)    { aCount=ab&0x0f;           aDataOff=ia+1; }
-    else if(ab==MP_MAP16)      { aCount=mpRead16(a+ia+1);  aDataOff=ia+3; }
-    else                       { aCount=mpRead32(a+ia+1);  aDataOff=ia+5; }
+    else if(ab==MP_MAP16){
+      if(ia+3>n){ aIsMap=0; }
+      else { aCount=mpRead16(a+ia+1);  aDataOff=ia+3; }
+    } else {
+      if(ia+5>n){ aIsMap=0; }
+      else { aCount=mpRead32(a+ia+1);  aDataOff=ia+5; }
+    }
   }
 
   MpBuf tmp; mpBufInit(&tmp,out->pCtx);
@@ -1201,6 +1229,7 @@ static int mpMergePatch(
     u32 pMatchVal=0;
     u32 pc2=pDataOff;
     for(u32 k=0; k<pCount; k++){
+      if(pc2>=np) break;
       u8 pkb=p[pc2];
       const char *pkStr=0; u32 pkLen=0;
       if(pkb>=0xa0&&pkb<=0xbf)         {pkLen=pkb&0x1f;           pkStr=(const char*)(p+pc2+1);}
@@ -1222,7 +1251,7 @@ static int mpMergePatch(
       /* Drop this pair */
     } else if(foundInPatch){
       MpBuf mb; mpBufInit(&mb,out->pCtx);
-      int mrc=mpMergePatch(&mb, a,n,aValOff, p,np,pMatchVal);
+      int mrc=mpMergePatch(&mb, a,n,aValOff, p,np,pMatchVal, depth+1);
       if(mrc==SQLITE_OK){
         mpBufAppend(&tmp, a+ac, aValOff-ac); /* key */
         mpBufAppend(&tmp, mb.aBuf, mb.nUsed); /* merged val */
@@ -1254,6 +1283,7 @@ static int mpMergePatch(
     if(aIsMap){
       u32 ac2=aDataOff;
       for(u32 j=0; j<aCount; j++){
+        if(ac2>=n) break;
         u8 tkb=a[ac2];
         const char *tkStr=0; u32 tkLen=0;
         if(tkb>=0xa0&&tkb<=0xbf)         {tkLen=tkb&0x1f;           tkStr=(const char*)(a+ac2+1);}
@@ -1312,7 +1342,7 @@ static void msgpackPatchFunc(
   a=(const u8*)sqlite3_value_blob(argv[0]); n=(u32)sqlite3_value_bytes(argv[0]);
   p=(const u8*)sqlite3_value_blob(argv[1]); np=(u32)sqlite3_value_bytes(argv[1]);
   MpBuf out; mpBufInit(&out,ctx);
-  int rc=mpMergePatch(&out, a,n,0, p,np,0);
+  int rc=mpMergePatch(&out, a,n,0, p,np,0, 0);
   if(rc==SQLITE_OK){
     u32 nOut; u8 *res=mpBufFinish(&out,&nOut);
     if(res) sqlite3_result_blob(ctx,res,(int)nOut,sqlite3_free);
@@ -1646,6 +1676,7 @@ static void mpToJsonAt(
   char s[32];
 
   if( i>=n ){ mpBufAppend(out,(const u8*)"null",4); return; }
+  if( depth>MP_MAX_DEPTH ){ mpBufAppend(out,(const u8*)"null",4); return; }
   b = a[i];
 
   /* nil */
@@ -1658,23 +1689,25 @@ static void mpToJsonAt(
   if(b>=0xe0){ sqlite3_snprintf(32,s,"%d",(int)(signed char)b); mpBufAppend(out,(const u8*)s,(u32)strlen(s)); return; }
 
   switch(b){
-    case MP_UINT8:  sqlite3_snprintf(32,s,"%u",(unsigned)a[i+1]);                    goto numout;
-    case MP_UINT16: sqlite3_snprintf(32,s,"%u",(unsigned)mpRead16(a+i+1));           goto numout;
-    case MP_UINT32: sqlite3_snprintf(32,s,"%u",(unsigned)mpRead32(a+i+1));           goto numout;
-    case MP_UINT64: sqlite3_snprintf(32,s,"%llu",(unsigned long long)mpRead64(a+i+1));goto numout;
-    case MP_INT8:   sqlite3_snprintf(32,s,"%d",(int)(signed char)a[i+1]);            goto numout;
-    case MP_INT16:  sqlite3_snprintf(32,s,"%d",(int)(short)mpRead16(a+i+1));         goto numout;
-    case MP_INT32:  sqlite3_snprintf(32,s,"%d",(int)mpRead32(a+i+1));                goto numout;
-    case MP_INT64:  sqlite3_snprintf(32,s,"%lld",(long long)mpRead64(a+i+1));        goto numout;
+    case MP_UINT8:  if(i+2>n) break; sqlite3_snprintf(32,s,"%u",(unsigned)a[i+1]);                    goto numout;
+    case MP_UINT16: if(i+3>n) break; sqlite3_snprintf(32,s,"%u",(unsigned)mpRead16(a+i+1));           goto numout;
+    case MP_UINT32: if(i+5>n) break; sqlite3_snprintf(32,s,"%u",(unsigned)mpRead32(a+i+1));           goto numout;
+    case MP_UINT64: if(i+9>n) break; sqlite3_snprintf(32,s,"%llu",(unsigned long long)mpRead64(a+i+1));goto numout;
+    case MP_INT8:   if(i+2>n) break; sqlite3_snprintf(32,s,"%d",(int)(signed char)a[i+1]);            goto numout;
+    case MP_INT16:  if(i+3>n) break; sqlite3_snprintf(32,s,"%d",(int)(short)mpRead16(a+i+1));         goto numout;
+    case MP_INT32:  if(i+5>n) break; sqlite3_snprintf(32,s,"%d",(int)mpRead32(a+i+1));                goto numout;
+    case MP_INT64:  if(i+9>n) break; sqlite3_snprintf(32,s,"%lld",(long long)mpRead64(a+i+1));        goto numout;
     numout: mpBufAppend(out,(const u8*)s,(u32)strlen(s)); return;
 
     case MP_FLOAT32: {
+      if(i+5>n) break;
       u32 bits=mpRead32(a+i+1); float f; memcpy(&f,&bits,4);
       if( !isfinite((double)f) ){ mpBufAppend(out,(const u8*)"null",4); return; }
       sqlite3_snprintf(32,s,"%.7g",(double)f);
       goto fltout;
     }
     case MP_FLOAT64: {
+      if(i+9>n) break;
       u64 bits=mpRead64(a+i+1); double d; memcpy(&d,&bits,8);
       if( !isfinite(d) ){ mpBufAppend(out,(const u8*)"null",4); return; }
       sqlite3_snprintf(32,s,"%.17g",d);
@@ -1692,7 +1725,11 @@ static void mpToJsonAt(
     else if(b==MP_STR8 &&i+2<=n){ sLen=a[i+1]; sOff=i+2; }
     else if(b==MP_STR16&&i+3<=n){ sLen=mpRead16(a+i+1); sOff=i+3; }
     else if(b==MP_STR32&&i+5<=n){ sLen=mpRead32(a+i+1); sOff=i+5; }
-    if( sOff ){ mpJsonEscapeStr(out, a+sOff, sLen); return; }
+    if( sOff ){
+      if( sLen > n-sOff ) sLen = n-sOff;
+      mpJsonEscapeStr(out, a+sOff, sLen);
+      return;
+    }
   }
 
   /* bin → hex string */
@@ -1703,6 +1740,7 @@ static void mpToJsonAt(
     if( bOff ){
       static const char hex[]="0123456789abcdef";
       u32 j;
+      if( bLen > n-bOff ) bLen = n-bOff;
       mpBufAppend1(out,'"');
       for(j=0; j<bLen; j++){
         u8 by=a[bOff+j];
@@ -1723,6 +1761,7 @@ static void mpToJsonAt(
       u32 cur=dataOff, j;
       mpBufAppend1(out,'[');
       for(j=0; j<count; j++){
+        if( cur >= n ) break;
         u32 next=mpSkipOne(a,n,cur);
         if(j>0) mpBufAppend1(out,',');
         if(pretty) mpJsonNewline(out,depth+1,indentW);
@@ -1744,6 +1783,7 @@ static void mpToJsonAt(
       u32 cur=dataOff, j;
       mpBufAppend1(out,'{');
       for(j=0; j<count; j++){
+        if( cur >= n ) break;
         u32 valOff=mpSkipOne(a,n,cur);
         u32 pairEnd=valOff?mpSkipOne(a,n,valOff):0;
         if(j>0) mpBufAppend1(out,',');
