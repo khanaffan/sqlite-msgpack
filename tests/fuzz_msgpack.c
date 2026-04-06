@@ -1,7 +1,10 @@
 /*
 ** fuzz_msgpack.c — libFuzzer harness for the SQLite msgpack extension.
 **
-** Exercises all major SQL-facing entry points with arbitrary byte sequences.
+** Exercises ALL SQL-facing entry points with arbitrary byte sequences,
+** including scalar functions, path-based variants, constructors, aggregate
+** window functions, virtual tables, and round-trip conversions.
+**
 ** Build with: -fsanitize=fuzzer,address -DSQLITE_CORE
 ** Link against: sqlite3_amalg + msgpack_static
 **
@@ -23,25 +26,61 @@ extern int sqlite3_msgpack_init(sqlite3*, char**, const void*);
 */
 static sqlite3 *g_db = NULL;
 
-/*
-** Prepared statements — each exercises a different code path through the
-** extension.  Prepared once, rebound each iteration.
-*/
-static sqlite3_stmt *g_valid     = NULL;
-static sqlite3_stmt *g_to_json  = NULL;
-static sqlite3_stmt *g_pretty   = NULL;
-static sqlite3_stmt *g_type     = NULL;
-static sqlite3_stmt *g_arrlen   = NULL;
-static sqlite3_stmt *g_extract  = NULL;
-static sqlite3_stmt *g_set      = NULL;
-static sqlite3_stmt *g_remove   = NULL;
-static sqlite3_stmt *g_insert   = NULL;
-static sqlite3_stmt *g_replace  = NULL;
-static sqlite3_stmt *g_patch    = NULL;
-static sqlite3_stmt *g_each     = NULL;
-static sqlite3_stmt *g_tree     = NULL;
-static sqlite3_stmt *g_errpos   = NULL;
-static sqlite3_stmt *g_from_json = NULL;
+/* --- Prepared statements (one per entry point) --- */
+
+/* 1-arg scalar functions taking a blob */
+static sqlite3_stmt *g_valid        = NULL;
+static sqlite3_stmt *g_to_json      = NULL;
+static sqlite3_stmt *g_to_jsonb     = NULL;
+static sqlite3_stmt *g_pretty       = NULL;
+static sqlite3_stmt *g_type         = NULL;
+static sqlite3_stmt *g_arrlen       = NULL;
+static sqlite3_stmt *g_errpos       = NULL;
+static sqlite3_stmt *g_quote        = NULL;
+static sqlite3_stmt *g_msgpack      = NULL;
+
+/* 2-arg path variants: (?1 = blob, ?2 = path text) */
+static sqlite3_stmt *g_valid_path   = NULL;
+static sqlite3_stmt *g_type_path    = NULL;
+static sqlite3_stmt *g_arrlen_path  = NULL;
+static sqlite3_stmt *g_pretty_ind   = NULL;
+
+/* Extract / mutation with static path */
+static sqlite3_stmt *g_extract      = NULL;
+static sqlite3_stmt *g_set          = NULL;
+static sqlite3_stmt *g_remove       = NULL;
+static sqlite3_stmt *g_insert       = NULL;
+static sqlite3_stmt *g_replace      = NULL;
+static sqlite3_stmt *g_patch        = NULL;
+static sqlite3_stmt *g_arr_insert   = NULL;
+
+/* Extract / mutation with fuzzed path */
+static sqlite3_stmt *g_extract_fp   = NULL;
+static sqlite3_stmt *g_set_fp       = NULL;
+static sqlite3_stmt *g_remove_fp    = NULL;
+static sqlite3_stmt *g_insert_fp    = NULL;
+static sqlite3_stmt *g_replace_fp   = NULL;
+
+/* Multi-path extract */
+static sqlite3_stmt *g_extract_multi = NULL;
+
+/* Constructors */
+static sqlite3_stmt *g_array_ctor   = NULL;
+static sqlite3_stmt *g_object_ctor  = NULL;
+
+/* Virtual tables */
+static sqlite3_stmt *g_each         = NULL;
+static sqlite3_stmt *g_tree         = NULL;
+static sqlite3_stmt *g_each_path    = NULL;
+static sqlite3_stmt *g_tree_path    = NULL;
+
+/* JSON → msgpack and round-trip */
+static sqlite3_stmt *g_from_json    = NULL;
+static sqlite3_stmt *g_roundtrip    = NULL;
+
+/* Aggregate / window functions */
+static sqlite3_stmt *g_group_array  = NULL;
+static sqlite3_stmt *g_group_object = NULL;
 
 static void prep(sqlite3_stmt **pp, const char *sql) {
   if (sqlite3_prepare_v2(g_db, sql, -1, pp, NULL) != SQLITE_OK) {
@@ -59,70 +98,168 @@ static void run_blob(sqlite3_stmt *s, const uint8_t *data, size_t size) {
   drain(s);
 }
 
+/* Bind blob as ?1 and a NUL-terminated text path as ?2 */
+static void run_blob_text(sqlite3_stmt *s,
+                          const uint8_t *blob, size_t blobsz,
+                          const char *text, size_t textsz) {
+  sqlite3_bind_blob(s, 1, blob, (int)blobsz, SQLITE_STATIC);
+  sqlite3_bind_text(s, 2, text, (int)textsz, SQLITE_STATIC);
+  drain(s);
+}
+
 int LLVMFuzzerInitialize(int *argc, char ***argv) {
   (void)argc; (void)argv;
 
   if (sqlite3_open(":memory:", &g_db) != SQLITE_OK) abort();
   if (sqlite3_msgpack_init(g_db, NULL, NULL) != SQLITE_OK) abort();
 
-  /* Scalar functions: bind the blob as ?1 */
+  /* ── 1-arg scalar functions ─────────────────────────────────────── */
   prep(&g_valid,    "SELECT msgpack_valid(?1)");
   prep(&g_to_json,  "SELECT msgpack_to_json(?1)");
+  prep(&g_to_jsonb, "SELECT msgpack_to_jsonb(?1)");
   prep(&g_pretty,   "SELECT msgpack_pretty(?1)");
   prep(&g_type,     "SELECT msgpack_type(?1)");
   prep(&g_arrlen,   "SELECT msgpack_array_length(?1)");
-  prep(&g_extract,  "SELECT msgpack_extract(?1, '$')");
-  prep(&g_set,      "SELECT msgpack_set(?1, '$[0]', 99)");
-  prep(&g_remove,   "SELECT msgpack_remove(?1, '$[0]')");
-  prep(&g_insert,   "SELECT msgpack_insert(?1, '$[0]', 99)");
-  prep(&g_replace,  "SELECT msgpack_replace(?1, '$[0]', 99)");
-  prep(&g_patch,    "SELECT msgpack_patch(?1, ?1)");
   prep(&g_errpos,   "SELECT msgpack_error_position(?1)");
+  prep(&g_quote,    "SELECT msgpack_quote(?1)");
+  prep(&g_msgpack,  "SELECT hex(msgpack(?1))");
 
-  /* Virtual tables: consume all rows */
-  prep(&g_each, "SELECT * FROM msgpack_each(?1)");
-  prep(&g_tree, "SELECT * FROM msgpack_tree(?1)");
+  /* ── 2-arg path variants ────────────────────────────────────────── */
+  prep(&g_valid_path,  "SELECT msgpack_valid(?1, ?2)");
+  prep(&g_type_path,   "SELECT msgpack_type(?1, ?2)");
+  prep(&g_arrlen_path, "SELECT msgpack_array_length(?1, ?2)");
+  prep(&g_pretty_ind,  "SELECT msgpack_pretty(?1, ?2)");
 
-  /* JSON→msgpack path: treat input as text */
+  /* ── Extract / mutation with static paths ───────────────────────── */
+  prep(&g_extract,     "SELECT msgpack_extract(?1, '$')");
+  prep(&g_set,         "SELECT msgpack_set(?1, '$[0]', 99)");
+  prep(&g_remove,      "SELECT msgpack_remove(?1, '$[0]')");
+  prep(&g_insert,      "SELECT msgpack_insert(?1, '$[0]', 99)");
+  prep(&g_replace,     "SELECT msgpack_replace(?1, '$[0]', 99)");
+  prep(&g_patch,       "SELECT msgpack_patch(?1, ?1)");
+  prep(&g_arr_insert,  "SELECT msgpack_array_insert(?1, '$[0]', 99)");
+
+  /* ── Extract / mutation with fuzzed path (?2) ───────────────────── */
+  prep(&g_extract_fp,  "SELECT msgpack_extract(?1, ?2)");
+  prep(&g_set_fp,      "SELECT msgpack_set(?1, ?2, 99)");
+  prep(&g_remove_fp,   "SELECT msgpack_remove(?1, ?2)");
+  prep(&g_insert_fp,   "SELECT msgpack_insert(?1, ?2, 99)");
+  prep(&g_replace_fp,  "SELECT msgpack_replace(?1, ?2, 99)");
+
+  /* ── Multi-path extract ─────────────────────────────────────────── */
+  prep(&g_extract_multi, "SELECT msgpack_extract(?1, '$[0]', '$.a', '$')");
+
+  /* ── Constructors: feed fuzz blob as if it were a SQL value ─────── */
+  prep(&g_array_ctor,  "SELECT hex(msgpack_array(?1, ?1, ?1))");
+  prep(&g_object_ctor, "SELECT hex(msgpack_object('k', ?1))");
+
+  /* ── Virtual tables ─────────────────────────────────────────────── */
+  prep(&g_each,      "SELECT * FROM msgpack_each(?1)");
+  prep(&g_tree,      "SELECT * FROM msgpack_tree(?1)");
+  prep(&g_each_path, "SELECT * FROM msgpack_each(?1, ?2)");
+  prep(&g_tree_path, "SELECT * FROM msgpack_tree(?1, ?2)");
+
+  /* ── JSON→msgpack and round-trip ────────────────────────────────── */
   prep(&g_from_json, "SELECT hex(msgpack_from_json(?1))");
+  prep(&g_roundtrip, "SELECT msgpack_to_json(msgpack_from_json(?1))");
+
+  /* ── Aggregate / window functions via sub-select on json_each ──── */
+  prep(&g_group_array,
+    "SELECT hex(msgpack_group_array(value)) "
+    "FROM (SELECT value FROM json_each('[1,2,3]'))");
+  prep(&g_group_object,
+    "SELECT hex(msgpack_group_object(key, value)) "
+    "FROM (SELECT key, value FROM json_each('{\"a\":1,\"b\":2}'))");
 
   return 0;
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-  /* Cap input size to avoid spending too long on pathological inputs */
   if (size > 4096) return 0;
 
-  /* --- Scalar functions with raw blob input --- */
+  /* --- Split input: first half = blob, second half = path text --- */
+  size_t split = size / 2;
+  const uint8_t *blob = data;
+  size_t blobsz = split > 0 ? split : size;
+  /* Ensure NUL-terminated path from the second half */
+  char pathbuf[2048];
+  size_t pathsz = size - split;
+  if (pathsz >= sizeof(pathbuf)) pathsz = sizeof(pathbuf) - 1;
+  if (pathsz > 0) memcpy(pathbuf, data + split, pathsz);
+  pathbuf[pathsz] = '\0';
+
+  /* ── 1-arg scalar functions with raw blob input ─────────────────── */
   run_blob(g_valid,   data, size);
   run_blob(g_to_json, data, size);
+  run_blob(g_to_jsonb, data, size);
   run_blob(g_type,    data, size);
   run_blob(g_arrlen,  data, size);
-  run_blob(g_extract, data, size);
   run_blob(g_errpos,  data, size);
+  run_blob(g_quote,   data, size);
+  run_blob(g_msgpack, data, size);
 
-  /* pretty uses same code as to_json; only test on small inputs */
   if (size <= 256) {
     run_blob(g_pretty, data, size);
   }
 
-  /* --- Mutation functions --- */
-  run_blob(g_set,     data, size);
-  run_blob(g_remove,  data, size);
-  run_blob(g_insert,  data, size);
-  run_blob(g_replace, data, size);
-  run_blob(g_patch,   data, size);
+  /* ── 2-arg path variants (blob + fuzzed path) ──────────────────── */
+  if (pathsz > 0) {
+    run_blob_text(g_valid_path,  blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_type_path,   blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_arrlen_path, blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_pretty_ind,  blob, blobsz, pathbuf, pathsz);
+  }
 
-  /* --- Virtual tables --- */
+  /* ── Extract / mutation with static paths ───────────────────────── */
+  run_blob(g_extract,    data, size);
+  run_blob(g_set,        data, size);
+  run_blob(g_remove,     data, size);
+  run_blob(g_insert,     data, size);
+  run_blob(g_replace,    data, size);
+  run_blob(g_patch,      data, size);
+  run_blob(g_arr_insert, data, size);
+
+  /* ── Extract / mutation with fuzzed path ────────────────────────── */
+  if (pathsz > 0) {
+    run_blob_text(g_extract_fp,  blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_set_fp,      blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_remove_fp,   blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_insert_fp,   blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_replace_fp,  blob, blobsz, pathbuf, pathsz);
+  }
+
+  /* ── Multi-path extract ─────────────────────────────────────────── */
+  run_blob(g_extract_multi, data, size);
+
+  /* ── Constructors: use blob as a SQL value argument ─────────────── */
+  run_blob(g_array_ctor,  data, size);
+  run_blob(g_object_ctor, data, size);
+
+  /* ── Virtual tables ─────────────────────────────────────────────── */
   run_blob(g_each, data, size);
   run_blob(g_tree, data, size);
+  if (pathsz > 0) {
+    run_blob_text(g_each_path, blob, blobsz, pathbuf, pathsz);
+    run_blob_text(g_tree_path, blob, blobsz, pathbuf, pathsz);
+  }
 
-  /* --- JSON→msgpack: reinterpret bytes as text --- */
-  if (size > 0 && size < 4096) {
+  /* ── JSON→msgpack: reinterpret bytes as text ────────────────────── */
+  if (size > 0) {
     sqlite3_bind_text(g_from_json, 1, (const char *)data, (int)size,
                       SQLITE_STATIC);
     drain(g_from_json);
   }
+
+  /* ── Round-trip: JSON text → msgpack → JSON text ────────────────── */
+  if (size > 0 && size <= 1024) {
+    sqlite3_bind_text(g_roundtrip, 1, (const char *)data, (int)size,
+                      SQLITE_STATIC);
+    drain(g_roundtrip);
+  }
+
+  /* ── Aggregate / window functions (fixed data, exercises code paths) */
+  drain(g_group_array);
+  drain(g_group_object);
 
   return 0;
 }

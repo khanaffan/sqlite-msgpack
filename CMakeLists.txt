@@ -151,6 +151,22 @@ if(MSGPACK_BUILD_FUZZ)
     target_link_options(fuzz_msgpack PRIVATE -fsanitize=fuzzer,address)
 endif()
 
+# ── Fuzz corpus runner (no libFuzzer needed — runs corpus files directly) ─────
+if(MSGPACK_BUILD_TESTS)
+    add_executable(fuzz_corpus_runner
+        tests/fuzz_corpus_runner.c tests/fuzz_msgpack.c src/msgpack.c src/sqlite3.c)
+    target_include_directories(fuzz_corpus_runner PRIVATE include)
+    target_compile_definitions(fuzz_corpus_runner PRIVATE SQLITE_CORE
+        SQLITE_THREADSAFE=1 SQLITE_ENABLE_JSON1 SQLITE_ENABLE_LOAD_EXTENSION=1)
+    if(NOT MSVC)
+        target_compile_options(fuzz_corpus_runner PRIVATE -w)
+    endif()
+    target_platform_libs(fuzz_corpus_runner PRIVATE)
+    add_test(NAME fuzz_corpus
+        COMMAND fuzz_corpus_runner ${CMAKE_SOURCE_DIR}/tests/fuzz_corpus)
+    set_tests_properties(fuzz_corpus PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
+endif()
+
 # ── Install headers ───────────────────────────────────────────────────────────
 install(FILES include/sqlite3.h include/sqlite3ext.h DESTINATION include)
 
