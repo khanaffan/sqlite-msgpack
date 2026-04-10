@@ -2500,6 +2500,466 @@ static void msgpackVersionFunc(
   sqlite3_result_text(ctx, SQLITE_MSGPACK_VERSION, -1, SQLITE_STATIC);
 }
 
+/*
+** ============================================================
+** Phase 8: Schema Validation — msgpack_schema_validate(mp, schema)
+** ============================================================
+*/
+
+/* Read an integer value from msgpack at offset i. Returns 1 on success. */
+static int mpReadInt64At(const u8 *a, u32 n, u32 i, i64 *pOut){
+  u8 b;
+  if( i>=n ) return 0;
+  b = a[i];
+  if( b<=0x7f ){ *pOut=(i64)b; return 1; }
+  if( b>=0xe0 ){ *pOut=(i64)(signed char)b; return 1; }
+  switch( b ){
+    case MP_UINT8:  if(i+2<=n){ *pOut=(i64)a[i+1]; return 1; } break;
+    case MP_UINT16: if(i+3<=n){ *pOut=(i64)mpRead16(a+i+1); return 1; } break;
+    case MP_UINT32: if(i+5<=n){ *pOut=(i64)mpRead32(a+i+1); return 1; } break;
+    case MP_UINT64: if(i+9<=n){ *pOut=(i64)mpRead64(a+i+1); return 1; } break;
+    case MP_INT8:   if(i+2<=n){ *pOut=(i64)(signed char)a[i+1]; return 1; } break;
+    case MP_INT16:  if(i+3<=n){ *pOut=(i64)(short)(int)mpRead16(a+i+1); return 1; } break;
+    case MP_INT32:  if(i+5<=n){ *pOut=(i64)(int)mpRead32(a+i+1); return 1; } break;
+    case MP_INT64:  if(i+9<=n){ *pOut=(i64)mpRead64(a+i+1); return 1; } break;
+    default: break;
+  }
+  return 0;
+}
+
+/* Read a numeric value as double from msgpack at offset i. Returns 1 on success. */
+static int mpReadDoubleAt(const u8 *a, u32 n, u32 i, double *pOut){
+  i64 iv;
+  u8 b;
+  if( i>=n ) return 0;
+  b = a[i];
+  if( b==MP_FLOAT32 && i+5<=n ){
+    u32 bits=mpRead32(a+i+1); float f; memcpy(&f,&bits,4);
+    *pOut=(double)f; return 1;
+  }
+  if( b==MP_FLOAT64 && i+9<=n ){
+    u64 bits=mpRead64(a+i+1); double d; memcpy(&d,&bits,8);
+    *pOut=d; return 1;
+  }
+  if( mpReadInt64At(a,n,i,&iv) ){
+    *pOut=(double)iv; return 1;
+  }
+  return 0;
+}
+
+/* Read a string pointer and length from msgpack at offset i. Returns 1 on success. */
+static int mpReadStringAt(const u8 *a, u32 n, u32 i, const char **pStr, u32 *pLen){
+  u8 b;
+  u32 sLen, sOff;
+  if( i>=n ) return 0;
+  b = a[i];
+  if( b>=0xa0 && b<=0xbf ){ sLen=b&0x1f; sOff=i+1; }
+  else if( b==MP_STR8  && i+2<=n ){ sLen=a[i+1]; sOff=i+2; }
+  else if( b==MP_STR16 && i+3<=n ){ sLen=mpRead16(a+i+1); sOff=i+3; }
+  else if( b==MP_STR32 && i+5<=n ){ sLen=mpRead32(a+i+1); sOff=i+5; }
+  else return 0;
+  if( sOff>n || sLen>n-sOff ) return 0;
+  *pLen = sLen;
+  *pStr = (const char*)(a+sOff);
+  return 1;
+}
+
+/* Get array element count and data offset. Returns 1 on success. */
+static int mpArrayInfo(const u8 *a, u32 n, u32 i, u32 *pCount, u32 *pDataOff){
+  u8 b;
+  if( i>=n ) return 0;
+  b = a[i];
+  if( b>=0x90 && b<=0x9f ){ *pCount=b&0x0f; *pDataOff=i+1; return 1; }
+  if( b==MP_ARRAY16 && i+3<=n ){ *pCount=mpRead16(a+i+1); *pDataOff=i+3; return 1; }
+  if( b==MP_ARRAY32 && i+5<=n ){ *pCount=mpRead32(a+i+1); *pDataOff=i+5; return 1; }
+  return 0;
+}
+
+/* Get map pair count and data offset. Returns 1 on success. */
+static int mpMapInfo(const u8 *a, u32 n, u32 i, u32 *pCount, u32 *pDataOff){
+  u8 b;
+  if( i>=n ) return 0;
+  b = a[i];
+  if( b>=0x80 && b<=0x8f ){ *pCount=b&0x0f; *pDataOff=i+1; return 1; }
+  if( b==MP_MAP16 && i+3<=n ){ *pCount=mpRead16(a+i+1); *pDataOff=i+3; return 1; }
+  if( b==MP_MAP32 && i+5<=n ){ *pCount=mpRead32(a+i+1); *pDataOff=i+5; return 1; }
+  return 0;
+}
+
+/* Find a string key in a msgpack map. Returns offset to value, or 0 if not found. */
+static u32 mpMapFindKey(const u8 *a, u32 n, u32 iMap, const char *key, u32 keyLen){
+  u32 count, off, j;
+  if( !mpMapInfo(a,n,iMap,&count,&off) ) return 0;
+  for( j=0; j<count; j++ ){
+    const char *kStr; u32 kLen;
+    u32 valOff = mpSkipOne(a,n,off);
+    if( !valOff || valOff>=n ) return 0;
+    if( mpReadStringAt(a,n,off,&kStr,&kLen)
+        && kLen==keyLen && memcmp(kStr,key,keyLen)==0 ){
+      return valOff;
+    }
+    off = mpSkipOne(a,n,valOff);
+    if( !off && j<count-1 ) return 0;
+  }
+  return 0;
+}
+
+/* Count UTF-8 codepoints in a byte string */
+static u32 mpUtf8CpCount(const char *s, u32 nBytes){
+  u32 count=0, i;
+  for( i=0; i<nBytes; ){
+    u8 b=(u8)s[i];
+    if( b<0x80 ) i+=1;
+    else if( (b&0xe0)==0xc0 ) i+=2;
+    else if( (b&0xf0)==0xe0 ) i+=3;
+    else if( (b&0xf8)==0xf0 ) i+=4;
+    else i+=1;
+    count++;
+  }
+  return count;
+}
+
+/* Check if a msgpack data type matches a schema type name */
+static int mpSchemaTypeMatch(const char *dataType, const char *schemaType, u32 stLen){
+  u32 dtLen;
+  if( stLen==3 && memcmp(schemaType,"any",3)==0 ) return 1;
+  if( stLen==4 && memcmp(schemaType,"bool",4)==0 ){
+    return (strcmp(dataType,"true")==0 || strcmp(dataType,"false")==0);
+  }
+  dtLen=(u32)strlen(dataType);
+  return (dtLen==stLen && memcmp(dataType,schemaType,dtLen)==0);
+}
+
+/* Compare two msgpack values for equality (byte-level on encoded form) */
+static int mpValuesEqual(
+  const u8 *a1, u32 n1, u32 i1,
+  const u8 *a2, u32 n2, u32 i2
+){
+  u32 end1=mpSkipOne(a1,n1,i1);
+  u32 end2=mpSkipOne(a2,n2,i2);
+  u32 len1, len2;
+  if( !end1 || !end2 ) return 0;
+  len1=end1-i1;
+  len2=end2-i2;
+  if( len1!=len2 ) return 0;
+  return memcmp(a1+i1,a2+i2,len1)==0;
+}
+
+/*
+** Core recursive schema validator.
+** Returns 1 if data at iData conforms to schema at iSchema, 0 otherwise.
+*/
+static int mpSchemaValidateAt(
+  const u8 *data, u32 nData, u32 iData,
+  const u8 *schema, u32 nSchema, u32 iSchema,
+  int depth
+){
+  const char *dataType;
+  u32 off;
+
+  if( depth>MP_MAX_DEPTH ) return 0;
+  if( iSchema>=nSchema ) return 1;
+
+  /* Boolean schema: true → always valid, false → never valid */
+  if( schema[iSchema]==MP_TRUE ) return 1;
+  if( schema[iSchema]==MP_FALSE ) return 0;
+
+  /* Schema must be a map; empty or non-map schema validates anything */
+  { u32 sCount, sOff;
+    if( !mpMapInfo(schema,nSchema,iSchema,&sCount,&sOff) ) return 1;
+    if( sCount==0 ) return 1;
+  }
+
+  dataType = mpGetTypeStr(data,nData,iData);
+
+  /* ── "type" keyword ───────────────────────────────────────────── */
+  off = mpMapFindKey(schema,nSchema,iSchema,"type",4);
+  if( off ){
+    const char *tStr; u32 tLen;
+    if( mpReadStringAt(schema,nSchema,off,&tStr,&tLen) ){
+      if( !mpSchemaTypeMatch(dataType,tStr,tLen) ) return 0;
+    } else {
+      u32 tCount, tDataOff;
+      if( mpArrayInfo(schema,nSchema,off,&tCount,&tDataOff) ){
+        int matched=0; u32 j, cur=tDataOff;
+        for( j=0; j<tCount && !matched; j++ ){
+          const char *ts; u32 tsLen;
+          if( mpReadStringAt(schema,nSchema,cur,&ts,&tsLen) ){
+            if( mpSchemaTypeMatch(dataType,ts,tsLen) ) matched=1;
+          }
+          cur=mpSkipOne(schema,nSchema,cur);
+          if( !cur ) break;
+        }
+        if( !matched ) return 0;
+      }
+    }
+  }
+
+  /* ── "const" keyword ──────────────────────────────────────────── */
+  off = mpMapFindKey(schema,nSchema,iSchema,"const",5);
+  if( off ){
+    if( !mpValuesEqual(data,nData,iData,schema,nSchema,off) ) return 0;
+  }
+
+  /* ── "enum" keyword ───────────────────────────────────────────── */
+  off = mpMapFindKey(schema,nSchema,iSchema,"enum",4);
+  if( off ){
+    u32 eCount, eDataOff;
+    if( mpArrayInfo(schema,nSchema,off,&eCount,&eDataOff) ){
+      int matched=0; u32 j, cur=eDataOff;
+      for( j=0; j<eCount && !matched; j++ ){
+        if( mpValuesEqual(data,nData,iData,schema,nSchema,cur) ) matched=1;
+        cur=mpSkipOne(schema,nSchema,cur);
+        if( !cur ) break;
+      }
+      if( !matched ) return 0;
+    }
+  }
+
+  /* ── Numeric constraints (integer and real) ───────────────────── */
+  if( strcmp(dataType,"integer")==0 || strcmp(dataType,"real")==0 ){
+    double dv;
+    if( mpReadDoubleAt(data,nData,iData,&dv) ){
+      double sv;
+      off = mpMapFindKey(schema,nSchema,iSchema,"minimum",7);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv<sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"maximum",7);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv>sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"exclusiveMinimum",16);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv<=sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"exclusiveMaximum",16);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv>=sv ) return 0;
+      }
+    }
+  }
+
+  /* ── Text constraints ─────────────────────────────────────────── */
+  if( strcmp(dataType,"text")==0 ){
+    const char *str; u32 strLen;
+    if( mpReadStringAt(data,nData,iData,&str,&strLen) ){
+      i64 sv;
+      off = mpMapFindKey(schema,nSchema,iSchema,"minLength",9);
+      if( off && mpReadInt64At(schema,nSchema,off,&sv) ){
+        if( (i64)mpUtf8CpCount(str,strLen)<sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"maxLength",9);
+      if( off && mpReadInt64At(schema,nSchema,off,&sv) ){
+        if( (i64)mpUtf8CpCount(str,strLen)>sv ) return 0;
+      }
+    }
+  }
+
+  /* ── Array constraints ────────────────────────────────────────── */
+  if( strcmp(dataType,"array")==0 ){
+    u32 aCount, aDataOff;
+    if( mpArrayInfo(data,nData,iData,&aCount,&aDataOff) ){
+      i64 sv;
+      off = mpMapFindKey(schema,nSchema,iSchema,"minItems",8);
+      if( off && mpReadInt64At(schema,nSchema,off,&sv) ){
+        if( (i64)aCount<sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"maxItems",8);
+      if( off && mpReadInt64At(schema,nSchema,off,&sv) ){
+        if( (i64)aCount>sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"items",5);
+      if( off ){
+        if( schema[off]==MP_FALSE ){
+          if( aCount>0 ) return 0;
+        } else if( schema[off]!=MP_TRUE ){
+          u32 j, cur=aDataOff;
+          for( j=0; j<aCount; j++ ){
+            if( !mpSchemaValidateAt(data,nData,cur,schema,nSchema,off,depth+1) )
+              return 0;
+            cur=mpSkipOne(data,nData,cur);
+            if( !cur && j<aCount-1 ) return 0;
+          }
+        }
+      }
+    }
+  }
+
+  /* ── Map constraints ──────────────────────────────────────────── */
+  if( strcmp(dataType,"map")==0 ){
+    u32 mCount, mDataOff;
+    if( mpMapInfo(data,nData,iData,&mCount,&mDataOff) ){
+      u32 propsOff, reqOff, addPropsOff;
+
+      /* required: check that all required keys exist in data */
+      reqOff = mpMapFindKey(schema,nSchema,iSchema,"required",8);
+      if( reqOff ){
+        u32 rCount, rDataOff;
+        if( mpArrayInfo(schema,nSchema,reqOff,&rCount,&rDataOff) ){
+          u32 j, cur=rDataOff;
+          for( j=0; j<rCount; j++ ){
+            const char *rKey; u32 rKeyLen;
+            if( mpReadStringAt(schema,nSchema,cur,&rKey,&rKeyLen) ){
+              if( !mpMapFindKey(data,nData,iData,rKey,rKeyLen) ) return 0;
+            }
+            cur=mpSkipOne(schema,nSchema,cur);
+            if( !cur && j<rCount-1 ) return 0;
+          }
+        }
+      }
+
+      /* properties + additionalProperties: validate each data key/value */
+      propsOff = mpMapFindKey(schema,nSchema,iSchema,"properties",10);
+      addPropsOff = mpMapFindKey(schema,nSchema,iSchema,"additionalProperties",20);
+      {
+        u32 j, cur=mDataOff;
+        for( j=0; j<mCount; j++ ){
+          const char *kStr; u32 kLen;
+          u32 valOff = mpSkipOne(data,nData,cur);
+          if( !valOff ) return 0;
+
+          if( mpReadStringAt(data,nData,cur,&kStr,&kLen) ){
+            int isKnown = 0;
+            if( propsOff ){
+              u32 propSchema = mpMapFindKey(schema,nSchema,propsOff,kStr,kLen);
+              if( propSchema ){
+                isKnown = 1;
+                if( !mpSchemaValidateAt(data,nData,valOff,
+                      schema,nSchema,propSchema,depth+1) )
+                  return 0;
+              }
+            }
+            if( !isKnown && addPropsOff ){
+              if( schema[addPropsOff]==MP_FALSE ) return 0;
+              if( schema[addPropsOff]!=MP_TRUE ){
+                if( !mpSchemaValidateAt(data,nData,valOff,
+                      schema,nSchema,addPropsOff,depth+1) )
+                  return 0;
+              }
+            }
+          }
+
+          cur = mpSkipOne(data,nData,valOff);
+          if( !cur && j<mCount-1 ) return 0;
+        }
+      }
+    }
+  }
+
+  return 1;
+}
+
+/* Schema cache for sqlite3_set_auxdata — avoids re-parsing constant schemas */
+typedef struct MpSchemaCache {
+  u8 *aSchema;
+  u32 nSchema;
+} MpSchemaCache;
+
+static void mpSchemaCacheFree(void *p){
+  MpSchemaCache *sc = (MpSchemaCache*)p;
+  if( sc ){
+    sqlite3_free(sc->aSchema);
+    sqlite3_free(sc);
+  }
+}
+
+/*
+** msgpack_schema_validate(mp, schema)
+**   Returns 1 if mp conforms to schema, 0 otherwise.
+**   schema can be JSON text or a msgpack BLOB.
+*/
+static void msgpackSchemaValidateFunc(
+  sqlite3_context *ctx,
+  int argc,
+  sqlite3_value **argv
+){
+  const u8 *data;
+  u32 nData;
+  const u8 *schema = NULL;
+  u32 nSchema = 0;
+  int result;
+  MpSchemaCache *cached;
+  u8 *localSchema = NULL;
+
+  (void)argc;
+
+  /* First arg: msgpack data BLOB */
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ){
+    sqlite3_result_null(ctx); return;
+  }
+  if( sqlite3_value_type(argv[0])!=SQLITE_BLOB ){
+    sqlite3_result_int(ctx, 0); return;
+  }
+  data = (const u8*)sqlite3_value_blob(argv[0]);
+  nData = (u32)sqlite3_value_bytes(argv[0]);
+  if( !data || !nData ){ sqlite3_result_int(ctx, 0); return; }
+
+  /* Second arg: schema (TEXT or BLOB) */
+  if( sqlite3_value_type(argv[1])==SQLITE_NULL ){
+    sqlite3_result_null(ctx); return;
+  }
+
+  cached = (MpSchemaCache*)sqlite3_get_auxdata(ctx, 1);
+  if( cached ){
+    schema = cached->aSchema;
+    nSchema = cached->nSchema;
+  } else if( sqlite3_value_type(argv[1])==SQLITE_TEXT ){
+    const char *zJson = (const char*)sqlite3_value_text(argv[1]);
+    int nJson = sqlite3_value_bytes(argv[1]);
+    MpBuf buf;
+    MpJsonParser jp;
+    u32 nParsed;
+
+    if( !zJson ){ sqlite3_result_error_nomem(ctx); return; }
+    mpBufInit(&buf, NULL);
+    jp.z = zJson; jp.n = nJson; jp.i = 0;
+    if( mpJpParseValue(&jp, &buf)!=SQLITE_OK ){
+      mpBufReset(&buf);
+      sqlite3_result_error(ctx,
+        "msgpack_schema_validate: invalid JSON schema", -1);
+      return;
+    }
+    localSchema = mpBufFinish(&buf, &nParsed);
+    if( !localSchema ){ sqlite3_result_error_nomem(ctx); return; }
+    schema = localSchema;
+    nSchema = nParsed;
+  } else if( sqlite3_value_type(argv[1])==SQLITE_BLOB ){
+    schema = (const u8*)sqlite3_value_blob(argv[1]);
+    nSchema = (u32)sqlite3_value_bytes(argv[1]);
+  } else {
+    sqlite3_result_error(ctx,
+      "msgpack_schema_validate: schema must be TEXT or BLOB", -1);
+    return;
+  }
+
+  if( !schema || !nSchema ){
+    sqlite3_result_int(ctx, 0);
+    sqlite3_free(localSchema);
+    return;
+  }
+
+  result = mpSchemaValidateAt(data, nData, 0, schema, nSchema, 0, 0);
+  sqlite3_result_int(ctx, result);
+
+  /* Cache parsed schema for subsequent calls (copy to avoid ownership issues) */
+  if( localSchema && !cached ){
+    u8 *copy = (u8*)sqlite3_malloc(nSchema);
+    if( copy ){
+      MpSchemaCache *sc = (MpSchemaCache*)sqlite3_malloc(sizeof(MpSchemaCache));
+      if( sc ){
+        memcpy(copy, localSchema, nSchema);
+        sc->aSchema = copy;
+        sc->nSchema = nSchema;
+        sqlite3_set_auxdata(ctx, 1, sc, mpSchemaCacheFree);
+      } else {
+        sqlite3_free(copy);
+      }
+    }
+  }
+  sqlite3_free(localSchema);
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #elif defined(__GNUC__)
@@ -2648,6 +3108,12 @@ int sqlite3_msgpack_init(
   rc = sqlite3_create_function_v2(db, "msgpack_version", 0,
          SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
          0, msgpackVersionFunc, 0, 0, 0);
+  if( rc ) return rc;
+
+  /* Phase 8: Schema validation */
+  rc = sqlite3_create_function_v2(db, "msgpack_schema_validate", 2,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackSchemaValidateFunc, 0, 0, 0);
   if( rc ) return rc;
 
   return SQLITE_OK;
