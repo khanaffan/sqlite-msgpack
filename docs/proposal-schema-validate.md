@@ -1,7 +1,7 @@
 # Proposal: `msgpack_schema_validate` — Schema Validation for sqlite-msgpack
 
 **Date:** 2026-04-10  
-**Status:** Draft  
+**Status:** Phase 1 Implemented  
 **Author:** Affan Khan
 
 ---
