@@ -31,6 +31,7 @@ deterministic and side-effect free (copy-on-write mutation).
    - [JSON conversion](#json-conversion)
    - [Aggregates](#aggregates)
    - [Table-valued functions](#table-valued-functions)
+   - [Schema validation](#schema-validation)
 7. [BLOB auto-embedding](#blob-auto-embedding)
 8. [MessagePack spec compliance](#messagepack-spec-compliance)
 9. [Performance benchmarks](#performance-benchmarks)
@@ -566,6 +567,413 @@ FROM msgpack_tree(msgpack_from_json('{"a":{"b":[1,2,3]}}'))
 WHERE type NOT IN ('array','map');
 -- 3
 ```
+
+---
+
+### Schema validation
+
+#### `msgpack_schema_validate(mp, schema)`
+
+Validates a MessagePack BLOB against a schema definition. Returns `1` if the
+data conforms to the schema, `0` otherwise. This function enables data-contract
+enforcement directly in SQL — via `CHECK` constraints, triggers, or ad-hoc
+queries.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `mp` | BLOB | MessagePack value to validate |
+| `schema` | TEXT or BLOB | Schema — either a JSON text string or a pre-compiled msgpack BLOB |
+
+**Schema caching.** When `schema` is a constant expression (the common case in
+`CHECK` constraints and triggers), the parsed schema is cached automatically via
+SQLite's auxiliary data API. Subsequent rows reuse the cached schema, so there
+is no per-row JSON parsing overhead.
+
+##### Boolean schemas
+
+The simplest schemas are literal booleans:
+
+```sql
+-- true: accept anything
+SELECT msgpack_schema_validate(msgpack_quote(42), 'true');   -- 1
+
+-- false: reject everything
+SELECT msgpack_schema_validate(msgpack_quote(42), 'false');  -- 0
+
+-- empty object: accept anything (same as true)
+SELECT msgpack_schema_validate(msgpack_quote(42), '{}');     -- 1
+```
+
+##### Type validation — `type`
+
+The `type` keyword restricts the allowed MessagePack type. Valid type names:
+
+| Type name | Matches |
+|-----------|---------|
+| `"null"` | nil (`0xc0`) |
+| `"bool"` | true (`0xc3`) and false (`0xc2`) |
+| `"integer"` | all integer formats (fixint, uint8–64, int8–64) |
+| `"real"` | float32 and float64 |
+| `"text"` | all string formats (fixstr, str8/16/32) |
+| `"blob"` | all binary formats (bin8/16/32) |
+| `"array"` | all array formats (fixarray, array16/32) |
+| `"map"` | all map formats (fixmap, map16/32) |
+| `"any"` | any type (no restriction) |
+
+```sql
+-- Single type
+SELECT msgpack_schema_validate(msgpack_quote(42), '{"type":"integer"}');    -- 1
+SELECT msgpack_schema_validate(msgpack_quote('hi'), '{"type":"integer"}');  -- 0
+
+-- Union type (array of types)
+SELECT msgpack_schema_validate(
+  msgpack_quote(NULL),
+  '{"type":["integer","null"]}'
+);  -- 1
+
+-- Boolean matching
+SELECT msgpack_schema_validate(
+  msgpack_from_json('true'),
+  '{"type":"bool"}'
+);  -- 1
+```
+
+> **Note:** `msgpack_type()` returns `"true"` or `"false"` for boolean values,
+> not `"bool"`. The schema type `"bool"` is a convenience that matches both.
+> The type `"any"` matches every value type.
+
+##### Constant matching — `const`
+
+The `const` keyword requires the value to be byte-identical to a specific
+constant:
+
+```sql
+SELECT msgpack_schema_validate(
+  msgpack_quote(42),
+  '{"const":42}'
+);  -- 1
+
+SELECT msgpack_schema_validate(
+  msgpack_quote(99),
+  '{"const":42}'
+);  -- 0
+```
+
+##### Enumeration — `enum`
+
+The `enum` keyword lists the allowed values. The data must exactly match one of
+them:
+
+```sql
+SELECT msgpack_schema_validate(
+  msgpack_quote('active'),
+  '{"enum":["active","inactive","pending"]}'
+);  -- 1
+
+-- Mixed types are allowed
+SELECT msgpack_schema_validate(
+  msgpack_quote(NULL),
+  '{"enum":[1,2,3,"text",null,true,false]}'
+);  -- 1
+```
+
+##### Numeric constraints — `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`
+
+These keywords constrain integer and real values. All comparisons are performed
+using double-precision floating-point arithmetic.
+
+| Keyword | Meaning |
+|---------|---------|
+| `minimum` | value ≥ minimum |
+| `maximum` | value ≤ maximum |
+| `exclusiveMinimum` | value > exclusiveMinimum |
+| `exclusiveMaximum` | value < exclusiveMaximum |
+
+```sql
+-- Age must be 0–150
+SELECT msgpack_schema_validate(
+  msgpack_quote(25),
+  '{"type":"integer","minimum":0,"maximum":150}'
+);  -- 1
+
+-- Exclusive bounds
+SELECT msgpack_schema_validate(
+  msgpack_quote(0),
+  '{"type":"integer","exclusiveMinimum":0}'
+);  -- 0  (must be strictly > 0)
+
+-- Works with real values too
+SELECT msgpack_schema_validate(
+  msgpack_quote(3.14),
+  '{"type":"real","minimum":0.0,"maximum":10.0}'
+);  -- 1
+```
+
+> Numeric constraints are only evaluated when the data type is `"integer"` or
+> `"real"`. They are silently ignored for other types.
+
+##### Text constraints — `minLength`, `maxLength`
+
+These keywords constrain text (string) length measured in **UTF-8 codepoints**
+(not bytes).
+
+| Keyword | Meaning |
+|---------|---------|
+| `minLength` | codepoint count ≥ value |
+| `maxLength` | codepoint count ≤ value |
+
+```sql
+SELECT msgpack_schema_validate(
+  msgpack_quote('hello'),
+  '{"type":"text","minLength":1,"maxLength":100}'
+);  -- 1
+
+-- Empty string fails minLength:1
+SELECT msgpack_schema_validate(
+  msgpack_quote(''),
+  '{"type":"text","minLength":1}'
+);  -- 0
+
+-- Multi-byte UTF-8 characters count as single codepoints
+SELECT msgpack_schema_validate(
+  msgpack_quote('café'),
+  '{"type":"text","maxLength":4}'
+);  -- 1  (4 codepoints, not 5 bytes)
+```
+
+> Text constraints are only evaluated when the data type is `"text"`.
+
+##### Array constraints — `items`, `minItems`, `maxItems`
+
+| Keyword | Meaning |
+|---------|---------|
+| `items` | Schema that every element must satisfy, or `false` to disallow all elements |
+| `minItems` | array length ≥ value |
+| `maxItems` | array length ≤ value |
+
+```sql
+-- Array of integers, 1–10 elements
+SELECT msgpack_schema_validate(
+  msgpack_array(1, 2, 3),
+  '{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":10}'
+);  -- 1
+
+-- Items validation catches bad elements
+SELECT msgpack_schema_validate(
+  msgpack_array(1, 'oops', 3),
+  '{"type":"array","items":{"type":"integer"}}'
+);  -- 0
+
+-- items:false means the array must be empty
+SELECT msgpack_schema_validate(
+  msgpack_array(),
+  '{"type":"array","items":false}'
+);  -- 1
+
+SELECT msgpack_schema_validate(
+  msgpack_array(1),
+  '{"type":"array","items":false}'
+);  -- 0
+
+-- items:true accepts any elements (same as omitting items)
+SELECT msgpack_schema_validate(
+  msgpack_array(1, 'mixed', NULL),
+  '{"type":"array","items":true}'
+);  -- 1
+```
+
+> Array constraints are only evaluated when the data type is `"array"`.
+
+##### Map constraints — `properties`, `required`, `additionalProperties`
+
+| Keyword | Meaning |
+|---------|---------|
+| `properties` | Map of `key name → schema` for known properties |
+| `required` | Array of key names that must be present |
+| `additionalProperties` | `true` (default), `false`, or a schema for unknown keys |
+
+```sql
+-- User object with required fields
+SELECT msgpack_schema_validate(
+  msgpack_object('name', 'Alice', 'age', 30),
+  '{
+    "type": "map",
+    "required": ["name", "age"],
+    "properties": {
+      "name": {"type": "text", "minLength": 1},
+      "age":  {"type": "integer", "minimum": 0}
+    },
+    "additionalProperties": false
+  }'
+);  -- 1
+
+-- Missing required key
+SELECT msgpack_schema_validate(
+  msgpack_object('name', 'Alice'),
+  '{"type":"map","required":["name","age"]}'
+);  -- 0
+
+-- Additional properties: false rejects unknown keys
+SELECT msgpack_schema_validate(
+  msgpack_object('name', 'Alice', 'extra', 1),
+  '{
+    "type": "map",
+    "properties": {"name": {"type": "text"}},
+    "additionalProperties": false
+  }'
+);  -- 0
+
+-- Additional properties: schema validates unknown keys
+SELECT msgpack_schema_validate(
+  msgpack_object('name', 'Alice', 'tag', 'vip'),
+  '{
+    "type": "map",
+    "properties": {"name": {"type": "text"}},
+    "additionalProperties": {"type": "text"}
+  }'
+);  -- 1
+```
+
+> Map constraints are only evaluated when the data type is `"map"`.
+
+##### Nested schemas
+
+Schemas compose naturally. The `items` keyword for arrays and the `properties`
+keyword for maps both accept full schemas, allowing arbitrarily deep validation:
+
+```sql
+-- Array of user objects
+SELECT msgpack_schema_validate(
+  msgpack_array(
+    msgpack_object('name','Alice','age',30),
+    msgpack_object('name','Bob','age',25)
+  ),
+  '{
+    "type": "array",
+    "items": {
+      "type": "map",
+      "required": ["name", "age"],
+      "properties": {
+        "name": {"type": "text"},
+        "age":  {"type": "integer", "minimum": 0}
+      }
+    }
+  }'
+);  -- 1
+
+-- Deeply nested: map → map → array → integer
+SELECT msgpack_schema_validate(
+  msgpack_object('outer',
+    msgpack_object('inner',
+      msgpack_array(1, 2, 3))),
+  '{
+    "type": "map",
+    "properties": {
+      "outer": {
+        "type": "map",
+        "properties": {
+          "inner": {
+            "type": "array",
+            "items": {"type": "integer"}
+          }
+        }
+      }
+    }
+  }'
+);  -- 1
+```
+
+Recursion is limited to a depth of 200 levels to prevent stack overflow.
+
+##### Usage patterns
+
+**CHECK constraints on table columns:**
+
+```sql
+CREATE TABLE events (
+  id    INTEGER PRIMARY KEY,
+  data  BLOB NOT NULL
+    CHECK (msgpack_schema_validate(data, '{
+      "type": "map",
+      "required": ["event", "ts"],
+      "properties": {
+        "event": {"type": "text"},
+        "ts":    {"type": "integer", "minimum": 0},
+        "meta":  {"type": "map"}
+      }
+    }'))
+);
+
+-- Succeeds
+INSERT INTO events(data) VALUES (
+  msgpack_object('event', 'click', 'ts', 1712345678)
+);
+
+-- Fails CHECK constraint — missing 'ts'
+INSERT INTO events(data) VALUES (
+  msgpack_object('event', 'click')
+);
+```
+
+**Stored schemas in a lookup table:**
+
+```sql
+CREATE TABLE schemas (
+  name   TEXT PRIMARY KEY,
+  schema TEXT NOT NULL
+);
+
+INSERT INTO schemas VALUES ('user_v1', '{
+  "type": "map",
+  "required": ["name", "email"],
+  "properties": {
+    "name":  {"type": "text", "minLength": 1},
+    "email": {"type": "text"},
+    "age":   {"type": "integer", "minimum": 0, "maximum": 150}
+  }
+}');
+
+-- Validate on insert via trigger
+CREATE TRIGGER validate_users BEFORE INSERT ON users
+BEGIN
+  SELECT RAISE(ABORT, 'schema validation failed')
+  WHERE NOT msgpack_schema_validate(
+    NEW.profile,
+    (SELECT schema FROM schemas WHERE name = 'user_v1')
+  );
+END;
+```
+
+**Finding invalid rows in existing data:**
+
+```sql
+SELECT rowid, msgpack_to_json(data)
+FROM events
+WHERE NOT msgpack_schema_validate(data, '{
+  "type": "map",
+  "required": ["event", "ts"]
+}');
+```
+
+##### Schema keyword reference
+
+| Category | Keyword | Value type | Description |
+|----------|---------|------------|-------------|
+| General | `type` | text or array | Required type name(s) |
+| General | `const` | any | Exact value match |
+| General | `enum` | array | List of allowed values |
+| Numeric | `minimum` | number | value ≥ minimum |
+| Numeric | `maximum` | number | value ≤ maximum |
+| Numeric | `exclusiveMinimum` | number | value > exclusiveMinimum |
+| Numeric | `exclusiveMaximum` | number | value < exclusiveMaximum |
+| Text | `minLength` | integer | UTF-8 codepoint count ≥ value |
+| Text | `maxLength` | integer | UTF-8 codepoint count ≤ value |
+| Array | `items` | schema or bool | Schema for all elements, or `false` to require empty |
+| Array | `minItems` | integer | array length ≥ value |
+| Array | `maxItems` | integer | array length ≤ value |
+| Map | `properties` | object | Map of key name → sub-schema |
+| Map | `required` | array of text | Keys that must exist |
+| Map | `additionalProperties` | bool or schema | Constraint for unlisted keys |
 
 ---
 

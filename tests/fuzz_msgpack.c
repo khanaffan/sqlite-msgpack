@@ -82,6 +82,25 @@ static sqlite3_stmt *g_roundtrip    = NULL;
 static sqlite3_stmt *g_group_array  = NULL;
 static sqlite3_stmt *g_group_object = NULL;
 
+/* Schema validation: blob data + static schemas */
+static sqlite3_stmt *g_sv_type_int  = NULL;
+static sqlite3_stmt *g_sv_type_text = NULL;
+static sqlite3_stmt *g_sv_type_arr  = NULL;
+static sqlite3_stmt *g_sv_type_map  = NULL;
+static sqlite3_stmt *g_sv_numeric   = NULL;
+static sqlite3_stmt *g_sv_text_len  = NULL;
+static sqlite3_stmt *g_sv_arr_items = NULL;
+static sqlite3_stmt *g_sv_map_full  = NULL;
+static sqlite3_stmt *g_sv_nested    = NULL;
+static sqlite3_stmt *g_sv_enum      = NULL;
+static sqlite3_stmt *g_sv_union     = NULL;
+
+/* Schema validation: blob data + fuzzed schema text */
+static sqlite3_stmt *g_sv_fuzz_text = NULL;
+
+/* Schema validation: blob data + fuzzed schema blob */
+static sqlite3_stmt *g_sv_fuzz_blob = NULL;
+
 static void prep(sqlite3_stmt **pp, const char *sql) {
   if (sqlite3_prepare_v2(g_db, sql, -1, pp, NULL) != SQLITE_OK) {
     abort();
@@ -171,6 +190,53 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
     "SELECT hex(msgpack_group_object(key, value)) "
     "FROM (SELECT key, value FROM json_each('{\"a\":1,\"b\":2}'))");
 
+  /* ── Schema validation: blob data + static schemas ─────────────── */
+  prep(&g_sv_type_int,
+    "SELECT msgpack_schema_validate(?1, '{\"type\":\"integer\"}')");
+  prep(&g_sv_type_text,
+    "SELECT msgpack_schema_validate(?1, '{\"type\":\"text\"}')");
+  prep(&g_sv_type_arr,
+    "SELECT msgpack_schema_validate(?1, '{\"type\":\"array\","
+    "\"items\":{\"type\":\"integer\"},\"minItems\":0,\"maxItems\":100}')");
+  prep(&g_sv_type_map,
+    "SELECT msgpack_schema_validate(?1, '{\"type\":\"map\","
+    "\"required\":[\"id\",\"name\"],"
+    "\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"name\":{\"type\":\"text\",\"minLength\":1,\"maxLength\":255}},"
+    "\"additionalProperties\":false}')");
+  prep(&g_sv_numeric,
+    "SELECT msgpack_schema_validate(?1, "
+    "'{\"type\":\"integer\",\"minimum\":-100,\"maximum\":100,"
+    "\"exclusiveMinimum\":-101,\"exclusiveMaximum\":101}')");
+  prep(&g_sv_text_len,
+    "SELECT msgpack_schema_validate(?1, "
+    "'{\"type\":\"text\",\"minLength\":1,\"maxLength\":1000}')");
+  prep(&g_sv_arr_items,
+    "SELECT msgpack_schema_validate(?1, "
+    "'{\"type\":\"array\",\"items\":{\"type\":\"map\","
+    "\"properties\":{\"x\":{\"type\":\"integer\"}}}}')");
+  prep(&g_sv_map_full,
+    "SELECT msgpack_schema_validate(?1, "
+    "'{\"type\":\"map\",\"properties\":{\"a\":{\"type\":\"integer\"},"
+    "\"b\":{\"type\":\"text\"},\"c\":{\"type\":\"array\"}},"
+    "\"additionalProperties\":{\"type\":\"text\"}}')");
+  prep(&g_sv_nested,
+    "SELECT msgpack_schema_validate(?1, "
+    "'{\"type\":\"map\",\"properties\":{\"inner\":{"
+    "\"type\":\"map\",\"properties\":{\"deep\":{"
+    "\"type\":\"array\",\"items\":{\"type\":\"integer\"}}}}}}')");
+  prep(&g_sv_enum,
+    "SELECT msgpack_schema_validate(?1, "
+    "'{\"enum\":[1,2,3,\"active\",\"inactive\",null,true,false]}')");
+  prep(&g_sv_union,
+    "SELECT msgpack_schema_validate(?1, "
+    "'{\"type\":[\"integer\",\"text\",\"null\"]}')");
+
+  /* ── Schema validation: fuzzed schema as text or blob ──────────── */
+  prep(&g_sv_fuzz_text,
+    "SELECT msgpack_schema_validate(?1, ?2)");
+  prep(&g_sv_fuzz_blob,
+    "SELECT msgpack_schema_validate(?1, ?2)");
   return 0;
 }
 
@@ -260,6 +326,32 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   /* ── Aggregate / window functions (fixed data, exercises code paths) */
   drain(g_group_array);
   drain(g_group_object);
+
+  /* ── Schema validation: fuzzed blob against static schemas ─────── */
+  run_blob(g_sv_type_int,  data, size);
+  run_blob(g_sv_type_text, data, size);
+  run_blob(g_sv_type_arr,  data, size);
+  run_blob(g_sv_type_map,  data, size);
+  run_blob(g_sv_numeric,   data, size);
+  run_blob(g_sv_text_len,  data, size);
+  run_blob(g_sv_arr_items, data, size);
+  run_blob(g_sv_map_full,  data, size);
+  run_blob(g_sv_nested,    data, size);
+  run_blob(g_sv_enum,      data, size);
+  run_blob(g_sv_union,     data, size);
+
+  /* ── Schema validation: fuzzed blob + fuzzed schema as text ────── */
+  if (pathsz > 0) {
+    run_blob_text(g_sv_fuzz_text, blob, blobsz, pathbuf, pathsz);
+  }
+
+  /* ── Schema validation: fuzzed blob + fuzzed schema as blob ────── */
+  if (split > 0 && size > split) {
+    sqlite3_bind_blob(g_sv_fuzz_blob, 1, data, (int)split, SQLITE_STATIC);
+    sqlite3_bind_blob(g_sv_fuzz_blob, 2, data + split,
+                      (int)(size - split), SQLITE_STATIC);
+    drain(g_sv_fuzz_blob);
+  }
 
   return 0;
 }

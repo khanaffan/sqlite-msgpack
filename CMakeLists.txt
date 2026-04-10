@@ -133,6 +133,7 @@ if(MSGPACK_BUILD_TESTS)
     add_msgpack_test(msgpack_spec_p5 test_spec_p5_mutation.c)
     add_msgpack_test(msgpack_spec_p6 test_spec_p6_json.c)
     add_msgpack_test(msgpack_spec_p7 test_spec_p7_agg_vtab.c)
+    add_msgpack_test(msgpack_spec_p8 test_spec_p8_schema.c)
 
 endif()
 
