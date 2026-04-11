@@ -28,6 +28,7 @@ SQLITE_EXTENSION_INIT1
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* Unsigned integer types */
 typedef unsigned char  u8;
@@ -83,6 +84,8 @@ typedef sqlite3_uint64 u64;
 #define MP_FIXSTR_MASK    0xa0   /* 0xa0-0xbf */
 #define MP_NEGFIXINT_MASK 0xe0   /* 0xe0-0xff */
 #define MP_POSFIXINT_MAX  0x7f
+
+#define MP_TIMESTAMP_TYPE 0xFFu  /* ext type -1 (the official timestamp ext) */
 
 /*
 ** ============================================================
@@ -224,6 +227,11 @@ static u8 *mpBufFinish(MpBuf *p, u32 *pnOut){
 
 /* Forward declaration — defined after mpSkipOne below */
 static int mpIsValid(const u8 *a, u32 n);
+
+/* Forward declarations for timestamp helpers — defined before Phase 9 */
+static int  mpExtGetTypeByte(const u8 *a, u32 n, u32 i);
+static int  mpDecodeTimestamp(const u8 *a, u32 n, u32 i, i64 *pSec, u32 *pNsec);
+static int  mpFormatTimestamp(char *buf, i64 sec, u32 nsec);
 
 static void mpEncodeSqlValue(MpBuf *p, sqlite3_value *v){
   int t = sqlite3_value_type(v);
@@ -514,7 +522,9 @@ static const char *mpGetTypeStr(const u8 *a, u32 n, u32 i){
     case MP_MAP16:   case MP_MAP32:   return "map";
     case MP_EXT8:    case MP_EXT16:   case MP_EXT32:
     case MP_FIXEXT1: case MP_FIXEXT2: case MP_FIXEXT4:
-    case MP_FIXEXT8: case MP_FIXEXT16: return "ext";
+    case MP_FIXEXT8: case MP_FIXEXT16:
+      /* ext type -1 (0xFF) is the official msgpack timestamp; all others are "ext" */
+      return (mpExtGetTypeByte(a,n,i)==(int)MP_TIMESTAMP_TYPE) ? "timestamp" : "ext";
     default: return "null";
   }
 }
@@ -767,7 +777,18 @@ static void mpReturnElement(
                             SQLITE_TRANSIENT);
         return;
       }
-      /* bin / array / map / ext → BLOB */
+      /* bin / array / map / ext → BLOB
+      ** Exception: ext type -1 (timestamp) → decode to INTEGER or REAL */
+      { i64 tsec; u32 tnsec;
+        if( mpDecodeTimestamp(a, n, iStart, &tsec, &tnsec) ){
+          if( tnsec==0 ){
+            sqlite3_result_int64(ctx, tsec);
+          } else {
+            sqlite3_result_double(ctx, (double)tsec + (double)tnsec * 1e-9);
+          }
+          return;
+        }
+      }
       sqlite3_result_blob(ctx, a+iStart, (int)(iEnd-iStart), SQLITE_TRANSIENT);
       break;
     }
@@ -1088,29 +1109,26 @@ static void msgpackEditFunc(
   if(n) memcpy(cur,a,n);
   u32 nCur=n;
 
+  /* Reuse a single valBuf across iterations to amortize MpBuf init overhead */
+  MpBuf valBuf; mpBufInit(&valBuf,ctx);
   for( i=1; i<argc-1; i+=2 ){
     const char *zPath=(const char*)sqlite3_value_text(argv[i]);
 
-    /* Encode new value */
-    MpBuf valBuf; mpBufInit(&valBuf,ctx);
+    /* Encode new value (reuse valBuf) */
+    valBuf.nUsed = 0;
+    valBuf.bErr = 0;
     mpEncodeSqlValue(&valBuf, argv[i+1]);
-    u32 nNew; u8 *newBin=mpBufFinish(&valBuf,&nNew);
-    if(!newBin){ sqlite3_free(cur); return; }
+    if(valBuf.bErr){ sqlite3_free(cur); mpBufReset(&valBuf); return; }
 
     MpBuf outBuf; mpBufInit(&outBuf,ctx);
-    int rc=mpApplyEdit(&outBuf, cur,nCur, zPath, newBin,nNew, mode);
-    sqlite3_free(newBin);
+    mpApplyEdit(&outBuf, cur,nCur, zPath, valBuf.aBuf,valBuf.nUsed, mode);
 
     u32 nOut; u8 *outData=mpBufFinish(&outBuf,&nOut);
     sqlite3_free(cur);
-    if(!outData) return;
-    if(rc!=SQLITE_OK){
-      /* On path-miss for REPLACE/REMOVE, outData is the unchanged blob */
-      cur=outData; nCur=nOut;
-    } else {
-      cur=outData; nCur=nOut;
-    }
+    if(!outData){ mpBufReset(&valBuf); return; }
+    cur=outData; nCur=nOut;
   }
+  mpBufReset(&valBuf);
   sqlite3_result_blob(ctx, cur, (int)nCur, sqlite3_free);
 }
 
@@ -1154,6 +1172,13 @@ static int mpMergePatch(
   const u8 *p, u32 np, u32 ip,   /* patch element */
   int depth
 );
+
+/* Pre-scanned patch key entry for O(n+m) merge-patch */
+typedef struct MpPatchEntry {
+  const char *zKey; u32 nKey;
+  u32 keyOff, valOff, pairEnd;
+  int matched;  /* set to 1 when target already processed this key */
+} MpPatchEntry;
 
 static int mpMergePatch(
   MpBuf *out,
@@ -1202,6 +1227,30 @@ static int mpMergePatch(
     }
   }
 
+  /* Pre-scan patch keys into an index to avoid repeated parsing */
+  MpPatchEntry pStack[16];
+  MpPatchEntry *pIdx = pStack;
+  if( pCount > 16 ){
+    pIdx = (MpPatchEntry*)sqlite3_malloc(pCount * sizeof(MpPatchEntry));
+    if( !pIdx ) return SQLITE_NOMEM;
+  }
+  { u32 k, pc2 = pDataOff;
+    for( k=0; k<pCount; k++ ){
+      if(pc2>=np){ if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR; }
+      u8 pkb=p[pc2];
+      pIdx[k].zKey=0; pIdx[k].nKey=0; pIdx[k].keyOff=pc2; pIdx[k].matched=0;
+      if(pkb>=0xa0&&pkb<=0xbf)         {pIdx[k].nKey=pkb&0x1f;           pIdx[k].zKey=(const char*)(p+pc2+1);}
+      else if(pkb==MP_STR8 &&pc2+2<=np){pIdx[k].nKey=p[pc2+1];           pIdx[k].zKey=(const char*)(p+pc2+2);}
+      else if(pkb==MP_STR16&&pc2+3<=np){pIdx[k].nKey=mpRead16(p+pc2+1);  pIdx[k].zKey=(const char*)(p+pc2+3);}
+      else if(pkb==MP_STR32&&pc2+5<=np){pIdx[k].nKey=mpRead32(p+pc2+1);  pIdx[k].zKey=(const char*)(p+pc2+5);}
+      pIdx[k].valOff=mpSkipOne(p,np,pc2);
+      if(!pIdx[k].valOff){ if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR; }
+      pIdx[k].pairEnd=mpSkipOne(p,np,pIdx[k].valOff);
+      if(!pIdx[k].pairEnd){ if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR; }
+      pc2=pIdx[k].pairEnd;
+    }
+  }
+
   MpBuf tmp; mpBufInit(&tmp,out->pCtx);
   u32 newCount=0;
 
@@ -1211,7 +1260,7 @@ static int mpMergePatch(
   **   - Otherwise → copy verbatim */
   u32 ac=aDataOff;
   for(u32 j=0; j<aCount; j++){
-    if(ac>=n){ mpBufReset(&tmp); return SQLITE_ERROR; }
+    if(ac>=n){ mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR; }
     u8 kb=a[ac];
     const char *kStr=0; u32 kLen=0;
     if(kb>=0xa0&&kb<=0xbf)        {kLen=kb&0x1f;           kStr=(const char*)(a+ac+1);}
@@ -1220,31 +1269,21 @@ static int mpMergePatch(
     else if(kb==MP_STR32&&ac+5<=n){kLen=mpRead32(a+ac+1);  kStr=(const char*)(a+ac+5);}
 
     u32 aValOff=mpSkipOne(a,n,ac);
-    if(!aValOff){mpBufReset(&tmp);return SQLITE_ERROR;}
+    if(!aValOff){mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR;}
     u32 aPairEnd=mpSkipOne(a,n,aValOff);
-    if(!aPairEnd){mpBufReset(&tmp);return SQLITE_ERROR;}
+    if(!aPairEnd){mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR;}
 
-    /* Find this key in patch */
+    /* Find this key in pre-scanned patch index */
     int foundInPatch=0, patchIsNil=0;
     u32 pMatchVal=0;
-    u32 pc2=pDataOff;
     for(u32 k=0; k<pCount; k++){
-      if(pc2>=np) break;
-      u8 pkb=p[pc2];
-      const char *pkStr=0; u32 pkLen=0;
-      if(pkb>=0xa0&&pkb<=0xbf)         {pkLen=pkb&0x1f;           pkStr=(const char*)(p+pc2+1);}
-      else if(pkb==MP_STR8 &&pc2+2<=np){pkLen=p[pc2+1];           pkStr=(const char*)(p+pc2+2);}
-      else if(pkb==MP_STR16&&pc2+3<=np){pkLen=mpRead16(p+pc2+1);  pkStr=(const char*)(p+pc2+3);}
-      else if(pkb==MP_STR32&&pc2+5<=np){pkLen=mpRead32(p+pc2+1);  pkStr=(const char*)(p+pc2+5);}
-      u32 pvOff=mpSkipOne(p,np,pc2); if(!pvOff) break;
-      u32 ppEnd=mpSkipOne(p,np,pvOff); if(!ppEnd) break;
-      if(pkStr && kStr && (int)pkLen==(int)kLen &&
-         memcmp(pkStr,kStr,kLen)==0){
-        foundInPatch=1; pMatchVal=pvOff;
-        patchIsNil=(pvOff<np && p[pvOff]==MP_NIL);
+      if(pIdx[k].zKey && kStr && (int)pIdx[k].nKey==(int)kLen &&
+         memcmp(pIdx[k].zKey,kStr,kLen)==0){
+        foundInPatch=1; pMatchVal=pIdx[k].valOff;
+        patchIsNil=(pIdx[k].valOff<np && p[pIdx[k].valOff]==MP_NIL);
+        pIdx[k].matched=1;
         break;
       }
-      pc2=ppEnd;
     }
 
     if(foundInPatch && patchIsNil){
@@ -1265,47 +1304,14 @@ static int mpMergePatch(
     ac=aPairEnd;
   }
 
-  /* Phase 2: add patch pairs not already in target */
-  u32 pc=pDataOff;
+  /* Phase 2: add patch pairs not already matched in target (O(pCount)) */
   for(u32 k=0; k<pCount; k++){
-    if(pc>=np) break;
-    u8 pkb=p[pc];
-    const char *pkStr=0; u32 pkLen=0;
-    if(pkb>=0xa0&&pkb<=0xbf)         {pkLen=pkb&0x1f;           pkStr=(const char*)(p+pc+1);}
-    else if(pkb==MP_STR8 &&pc+2<=np) {pkLen=p[pc+1];            pkStr=(const char*)(p+pc+2);}
-    else if(pkb==MP_STR16&&pc+3<=np) {pkLen=mpRead16(p+pc+1);   pkStr=(const char*)(p+pc+3);}
-    else if(pkb==MP_STR32&&pc+5<=np) {pkLen=mpRead32(p+pc+1);   pkStr=(const char*)(p+pc+5);}
-    u32 pvOff=mpSkipOne(p,np,pc); if(!pvOff) break;
-    u32 ppEnd=mpSkipOne(p,np,pvOff); if(!ppEnd) break;
-
-    /* Is this key already in target? */
-    int inTarget=0;
-    if(aIsMap){
-      u32 ac2=aDataOff;
-      for(u32 j=0; j<aCount; j++){
-        if(ac2>=n) break;
-        u8 tkb=a[ac2];
-        const char *tkStr=0; u32 tkLen=0;
-        if(tkb>=0xa0&&tkb<=0xbf)         {tkLen=tkb&0x1f;           tkStr=(const char*)(a+ac2+1);}
-        else if(tkb==MP_STR8 &&ac2+2<=n) {tkLen=a[ac2+1];           tkStr=(const char*)(a+ac2+2);}
-        else if(tkb==MP_STR16&&ac2+3<=n) {tkLen=mpRead16(a+ac2+1);  tkStr=(const char*)(a+ac2+3);}
-        else if(tkb==MP_STR32&&ac2+5<=n) {tkLen=mpRead32(a+ac2+1);  tkStr=(const char*)(a+ac2+5);}
-        u32 tvOff=mpSkipOne(a,n,ac2); if(!tvOff) break;
-        u32 tpEnd=mpSkipOne(a,n,tvOff); if(!tpEnd) break;
-        if(tkStr&&pkStr&&(int)tkLen==(int)pkLen&&memcmp(tkStr,pkStr,tkLen)==0){
-          inTarget=1; break;
-        }
-        ac2=tpEnd;
-      }
-    }
-
-    /* Add if not in target and patch value is not nil */
-    if(!inTarget && pvOff<np && p[pvOff]!=MP_NIL){
-      mpBufAppend(&tmp, p+pc, ppEnd-pc);
+    if(!pIdx[k].matched && pIdx[k].valOff<np && p[pIdx[k].valOff]!=MP_NIL){
+      mpBufAppend(&tmp, p+pIdx[k].keyOff, pIdx[k].pairEnd-pIdx[k].keyOff);
       newCount++;
     }
-    pc=ppEnd;
   }
+  if(pIdx!=pStack) sqlite3_free(pIdx);
 
   mpEncodeMapHeader(out, newCount);
   mpBufAppend(out, tmp.aBuf, tmp.nUsed);
@@ -1634,12 +1640,17 @@ static void msgpackQuoteFunc(
 ** -------------------------------------------------------
 */
 
-/* Write a JSON-escaped string (with surrounding quotes) to out */
+/* Write a JSON-escaped string (with surrounding quotes) to out.
+** Batches consecutive safe characters into a single mpBufAppend call. */
 static void mpJsonEscapeStr(MpBuf *out, const u8 *s, u32 len){
-  u32 j;
+  u32 j, start;
   mpBufAppend1(out, '"');
+  start = 0;
   for( j=0; j<len; j++ ){
     u8 c = s[j];
+    if( c>=0x20 && c!='"' && c!='\\' ) continue;
+    /* Flush buffered safe characters */
+    if( j>start ) mpBufAppend(out, s+start, j-start);
     if( c=='"' ){
       u8 b[2]={'\\','"'}; mpBufAppend(out,b,2);
     } else if( c=='\\' ){
@@ -1650,21 +1661,28 @@ static void mpJsonEscapeStr(MpBuf *out, const u8 *s, u32 len){
       u8 b[2]={'\\','r'}; mpBufAppend(out,b,2);
     } else if( c=='\t' ){
       u8 b[2]={'\\','t'}; mpBufAppend(out,b,2);
-    } else if( c < 0x20 ){
+    } else {
       char esc[8]; sqlite3_snprintf(8,esc,"\\u%04x",(int)c);
       mpBufAppend(out,(const u8*)esc,6);
-    } else {
-      mpBufAppend1(out,c);
     }
+    start = j+1;
   }
+  /* Flush remaining safe characters */
+  if( len>start ) mpBufAppend(out, s+start, len-start);
   mpBufAppend1(out, '"');
 }
 
-/* Emit N spaces for pretty-printing indentation */
+/* Emit newline + indentation spaces for pretty-printing.
+** Uses a single mpBufAppend call with a pre-filled buffer. */
 static void mpJsonNewline(MpBuf *out, int depth, int indentW){
-  int i;
+  static const char spaces[] = "                                                                ";
+  int nSpaces = depth * indentW;
   mpBufAppend1(out, '\n');
-  for( i=0; i<depth*indentW; i++ ) mpBufAppend1(out,' ');
+  while( nSpaces > 0 ){
+    int chunk = nSpaces > (int)sizeof(spaces)-1 ? (int)sizeof(spaces)-1 : nSpaces;
+    mpBufAppend(out, (const u8*)spaces, (u32)chunk);
+    nSpaces -= chunk;
+  }
 }
 
 /* Recursively convert msgpack element at offset i to JSON text in out */
@@ -1742,10 +1760,19 @@ static void mpToJsonAt(
       u32 j;
       if( bLen > n-bOff ) bLen = n-bOff;
       mpBufAppend1(out,'"');
-      for(j=0; j<bLen; j++){
-        u8 by=a[bOff+j];
-        mpBufAppend1(out,(u8)hex[by>>4]);
-        mpBufAppend1(out,(u8)hex[by&0xf]);
+      /* Batch hex encoding through a stack buffer */
+      { u8 hbuf[128];
+        u32 hi=0;
+        for(j=0; j<bLen; j++){
+          u8 by=a[bOff+j];
+          hbuf[hi++]=(u8)hex[by>>4];
+          hbuf[hi++]=(u8)hex[by&0xf];
+          if( hi >= sizeof(hbuf) ){
+            mpBufAppend(out, hbuf, hi);
+            hi = 0;
+          }
+        }
+        if( hi > 0 ) mpBufAppend(out, hbuf, hi);
       }
       mpBufAppend1(out,'"');
       return;
@@ -1800,7 +1827,17 @@ static void mpToJsonAt(
     }
   }
 
-  /* ext / unknown → null */
+  /* ext: timestamp (type -1) → ISO 8601 string; other ext → null */
+  { i64 tsec; u32 tnsec;
+    if( mpDecodeTimestamp(a, n, i, &tsec, &tnsec) ){
+      char buf[40];
+      mpFormatTimestamp(buf, tsec, tnsec);
+      mpBufAppend1(out, '"');
+      mpBufAppend(out, (const u8*)buf, (u32)strlen(buf));
+      mpBufAppend1(out, '"');
+      return;
+    }
+  }
   mpBufAppend(out,(const u8*)"null",4);
 }
 
@@ -2066,8 +2103,9 @@ static void msgpackFromJsonFunc(
 
 typedef struct MpAggState {
   u8  *aBuf;    /* accumulated encoded elements / pairs */
-  u32  nBuf;    /* bytes used */
+  u32  nBuf;    /* bytes used (total written) */
   u32  nAlloc;  /* bytes allocated */
+  u32  nStart;  /* logical start offset (skipped by inverse) */
   u32  nCount;  /* element / pair count */
   u8   bErr;
 } MpAggState;
@@ -2084,6 +2122,16 @@ static void mpAggAppend(MpAggState *st, const u8 *data, u32 n, sqlite3_context *
   }
   memcpy(st->aBuf+st->nBuf, data, n);
   st->nBuf+=n;
+}
+
+/* Compact the buffer when wasted leading space exceeds half the allocation */
+static void mpAggMaybeCompact(MpAggState *st){
+  if( st->nStart > 0 && st->nStart >= st->nAlloc/2 ){
+    u32 live = st->nBuf - st->nStart;
+    memmove(st->aBuf, st->aBuf + st->nStart, live);
+    st->nBuf = live;
+    st->nStart = 0;
+  }
 }
 
 static void mpAggFreeState(MpAggState *st){
@@ -2111,7 +2159,7 @@ static void msgpackGroupArrayFinalize(sqlite3_context *ctx, int isFinal){
   if(!st||st->bErr){ sqlite3_result_null(ctx); return; }
   MpBuf out; mpBufInit(&out,ctx);
   mpEncodeArrayHeader(&out, st->nCount);
-  mpBufAppend(&out, st->aBuf, st->nBuf);
+  mpBufAppend(&out, st->aBuf + st->nStart, st->nBuf - st->nStart);
   u32 nRes; u8 *res=mpBufFinish(&out,&nRes);
   if(res) sqlite3_result_blob(ctx,res,(int)nRes,sqlite3_free);
   if(isFinal) mpAggFreeState(st);
@@ -2126,16 +2174,16 @@ static void msgpackGroupArrayValue(sqlite3_context *ctx){
 static void msgpackGroupArrayInverse(
   sqlite3_context *ctx, int argc, sqlite3_value **argv
 ){
-  /* Simplified inverse: just decrement count. Correct for non-overlapping windows. */
   MpAggState *st=(MpAggState*)sqlite3_aggregate_context(ctx,0);
   (void)argc; (void)argv;
   if(st && st->nCount>0){
-    /* Remove the first element from aBuf by re-skipping it */
-    u32 skip=mpSkipOne(st->aBuf, st->nBuf, 0);
-    if(skip && skip<=st->nBuf){
-      memmove(st->aBuf, st->aBuf+skip, st->nBuf-skip);
-      st->nBuf-=skip;
+    /* Advance start offset past the first element instead of memmove */
+    u32 live = st->nBuf - st->nStart;
+    u32 skip=mpSkipOne(st->aBuf + st->nStart, live, 0);
+    if(skip && skip<=live){
+      st->nStart += skip;
       st->nCount--;
+      mpAggMaybeCompact(st);
     }
   }
 }
@@ -2162,7 +2210,7 @@ static void msgpackGroupObjectFinalize(sqlite3_context *ctx, int isFinal){
   if(!st||st->bErr){ sqlite3_result_null(ctx); return; }
   MpBuf out; mpBufInit(&out,ctx);
   mpEncodeMapHeader(&out, st->nCount);
-  mpBufAppend(&out, st->aBuf, st->nBuf);
+  mpBufAppend(&out, st->aBuf + st->nStart, st->nBuf - st->nStart);
   u32 nRes; u8 *res=mpBufFinish(&out,&nRes);
   if(res) sqlite3_result_blob(ctx,res,(int)nRes,sqlite3_free);
   if(isFinal) mpAggFreeState(st);
@@ -2180,13 +2228,14 @@ static void msgpackGroupObjectInverse(
   MpAggState *st=(MpAggState*)sqlite3_aggregate_context(ctx,0);
   (void)argc; (void)argv;
   if(st && st->nCount>0){
-    /* Skip key + value */
-    u32 skip=mpSkipOne(st->aBuf,st->nBuf,0);
-    if(skip) skip=mpSkipOne(st->aBuf,st->nBuf,skip);
-    if(skip && skip<=st->nBuf){
-      memmove(st->aBuf, st->aBuf+skip, st->nBuf-skip);
-      st->nBuf-=skip;
+    /* Advance past key + value */
+    u32 live = st->nBuf - st->nStart;
+    u32 skip=mpSkipOne(st->aBuf + st->nStart, live, 0);
+    if(skip) skip=mpSkipOne(st->aBuf + st->nStart, live, skip);
+    if(skip && skip<=live){
+      st->nStart += skip;
       st->nCount--;
+      mpAggMaybeCompact(st);
     }
   }
 }
@@ -2626,6 +2675,10 @@ static int mpSchemaTypeMatch(const char *dataType, const char *schemaType, u32 s
   if( stLen==4 && memcmp(schemaType,"bool",4)==0 ){
     return (strcmp(dataType,"true")==0 || strcmp(dataType,"false")==0);
   }
+  /* "number" is an alias for integer or real (mirrors JSON Schema) */
+  if( stLen==6 && memcmp(schemaType,"number",6)==0 ){
+    return (strcmp(dataType,"integer")==0 || strcmp(dataType,"real")==0);
+  }
   dtLen=(u32)strlen(dataType);
   return (dtLen==stLen && memcmp(dataType,schemaType,dtLen)==0);
 }
@@ -2740,6 +2793,31 @@ static int mpSchemaValidateAt(
     }
   }
 
+  /* ── Timestamp constraints ────────────────────────────────────── */
+  if( strcmp(dataType,"timestamp")==0 ){
+    i64 tsec; u32 tnsec;
+    if( mpDecodeTimestamp(data,nData,iData,&tsec,&tnsec) ){
+      double dv = (double)tsec + (double)tnsec * 1e-9;
+      double sv;
+      off = mpMapFindKey(schema,nSchema,iSchema,"minimum",7);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv<sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"maximum",7);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv>sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"exclusiveMinimum",16);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv<=sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"exclusiveMaximum",16);
+      if( off && mpReadDoubleAt(schema,nSchema,off,&sv) ){
+        if( dv>=sv ) return 0;
+      }
+    }
+  }
+
   /* ── Text constraints ─────────────────────────────────────────── */
   if( strcmp(dataType,"text")==0 ){
     const char *str; u32 strLen;
@@ -2752,6 +2830,27 @@ static int mpSchemaValidateAt(
       off = mpMapFindKey(schema,nSchema,iSchema,"maxLength",9);
       if( off && mpReadInt64At(schema,nSchema,off,&sv) ){
         if( (i64)mpUtf8CpCount(str,strLen)>sv ) return 0;
+      }
+    }
+  }
+
+  /* ── Blob (bin) size constraints ─────────────────────────────── */
+  if( strcmp(dataType,"blob")==0 ){
+    u8 b2 = data[iData];
+    u32 bLen = 0;
+    int bOk = 0;
+    if( b2==MP_BIN8  && iData+2<=nData ){ bLen=data[iData+1];           bOk=1; }
+    else if( b2==MP_BIN16 && iData+3<=nData ){ bLen=mpRead16(data+iData+1); bOk=1; }
+    else if( b2==MP_BIN32 && iData+5<=nData ){ bLen=mpRead32(data+iData+1); bOk=1; }
+    if( bOk ){
+      i64 sv;
+      off = mpMapFindKey(schema,nSchema,iSchema,"minBytes",8);
+      if( off && mpReadInt64At(schema,nSchema,off,&sv) ){
+        if( (i64)bLen<sv ) return 0;
+      }
+      off = mpMapFindKey(schema,nSchema,iSchema,"maxBytes",8);
+      if( off && mpReadInt64At(schema,nSchema,off,&sv) ){
+        if( (i64)bLen>sv ) return 0;
       }
     }
   }
@@ -2960,6 +3059,449 @@ static void msgpackSchemaValidateFunc(
   sqlite3_free(localSchema);
 }
 
+/*
+** ============================================================
+** Timestamp helpers (msgpack ext type -1, stored as byte 0xFF)
+**
+** Three wire formats per the msgpack timestamp spec:
+**   ts32  fixext4 0xFF  — 4-byte uint32 seconds (no sub-second)
+**   ts64  fixext8 0xFF  — 8-byte: top 30 bits nsec, bottom 34 bits sec
+**   ts96  ext8(12) 0xFF — 4-byte int32 nsec + 8-byte int64 sec
+** ============================================================
+*/
+
+/* Read the ext type byte of the element at offset i.
+** Returns the byte value (0–255), or 256 on error / not an ext. */
+static int mpExtGetTypeByte(const u8 *a, u32 n, u32 i){
+  u8 b;
+  if( i >= n ) return 256;
+  b = a[i];
+  if( b==MP_FIXEXT1  && i+2  <= n ) return a[i+1];
+  if( b==MP_FIXEXT2  && i+3  <= n ) return a[i+1];
+  if( b==MP_FIXEXT4  && i+5  <= n ) return a[i+1];
+  if( b==MP_FIXEXT8  && i+9  <= n ) return a[i+1];
+  if( b==MP_FIXEXT16 && i+17 <= n ) return a[i+1];
+  if( b==MP_EXT8  && i+3 <= n ) return a[i+2];
+  if( b==MP_EXT16 && i+4 <= n ) return a[i+3];
+  if( b==MP_EXT32 && i+6 <= n ) return a[i+5];
+  return 256;
+}
+
+/* Decode a timestamp ext at offset i into seconds + nanoseconds.
+** Returns 1 on success, 0 if not a timestamp or malformed. */
+static int mpDecodeTimestamp(const u8 *a, u32 n, u32 i, i64 *pSec, u32 *pNsec){
+  u8 b;
+  if( i >= n ) return 0;
+  b = a[i];
+  /* ts32: fixext4, type=0xFF, 4-byte uint32 seconds */
+  if( b==MP_FIXEXT4 && i+6<=n && a[i+1]==MP_TIMESTAMP_TYPE ){
+    *pSec  = (i64)mpRead32(a+i+2);
+    *pNsec = 0;
+    return 1;
+  }
+  /* ts64: fixext8, type=0xFF, top-30-bits nsec | bottom-34-bits sec */
+  if( b==MP_FIXEXT8 && i+10<=n && a[i+1]==MP_TIMESTAMP_TYPE ){
+    u64 v  = mpRead64(a+i+2);
+    *pNsec = (u32)(v >> 34);
+    *pSec  = (i64)(v & (u64)0x3FFFFFFFFULL);
+    return 1;
+  }
+  /* ts96: ext8, len=12, type=0xFF, 4-byte nsec + 8-byte sec */
+  if( b==MP_EXT8 && i+15<=n && a[i+1]==12 && a[i+2]==MP_TIMESTAMP_TYPE ){
+    *pNsec = (u32)mpRead32(a+i+3);
+    *pSec  = (i64)mpRead64(a+i+7);
+    return 1;
+  }
+  return 0;
+}
+
+/* Format a timestamp as ISO 8601: "YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z"
+** into buf (at least 32 bytes). Returns length written. */
+static int mpFormatTimestamp(char *buf, i64 sec, u32 nsec){
+  time_t t = (time_t)sec;
+  struct tm tm_val;
+  int n;
+#if defined(_WIN32)
+  gmtime_s(&tm_val, &t);
+#else
+  gmtime_r(&t, &tm_val);
+#endif
+  n = (int)strftime(buf, 24, "%Y-%m-%dT%H:%M:%S", &tm_val);
+  if( nsec > 0 ){
+    /* trim trailing zeros from nanoseconds */
+    char frac[12];
+    int flen;
+    sqlite3_snprintf(12, frac, ".%09d", (int)nsec);
+    flen = (int)strlen(frac);
+    while( flen > 1 && frac[flen-1]=='0' ) flen--;
+    memcpy(buf+n, frac, (size_t)flen);
+    n += flen;
+  }
+  buf[n++] = 'Z';
+  buf[n]   = '\0';
+  return n;
+}
+
+/*
+** ============================================================
+** Phase 9: Typed primitive constructors
+**
+** These functions let SQL callers produce specific msgpack wire
+** types that SQLite's own type system cannot represent directly:
+**   float32, fixed-width ints, bool, nil, bin, ext, and timestamp.
+** ============================================================
+*/
+
+/* Helper: emit a finished MpBuf as a BLOB result */
+static void mpReturnBuf(sqlite3_context *ctx, MpBuf *p){
+  u32 n;
+  u8 *result = mpBufFinish(p, &n);
+  if( result ) sqlite3_result_blob(ctx, result, (int)n, sqlite3_free);
+}
+
+/* ── msgpack_timestamp(value) ─────────────────────────────────────────
+**
+** Encode a Unix timestamp as a msgpack timestamp ext (type -1).
+** Input: INTEGER (whole seconds) or REAL (seconds.nanoseconds).
+** Automatically selects the most compact format:
+**   ts32  (fixext4)  — 0 ≤ sec ≤ UINT32_MAX, nsec = 0
+**   ts64  (fixext8)  — 0 ≤ sec ≤ 2^34-1
+**   ts96  (ext8/12)  — full signed 64-bit range
+*/
+static void msgpackTimestampFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 sec;
+  u32 nsec;
+  int t;
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  t = sqlite3_value_type(argv[0]);
+  if( t == SQLITE_INTEGER ){
+    sec  = sqlite3_value_int64(argv[0]);
+    nsec = 0;
+  } else if( t == SQLITE_FLOAT ){
+    double d = sqlite3_value_double(argv[0]);
+    sec = (i64)d;
+    double frac = d - (double)sec;
+    if( frac < 0.0 ){ sec--; frac += 1.0; }
+    nsec = (u32)(frac * 1e9 + 0.5);
+    if( nsec >= 1000000000U ){ nsec = 0; sec++; }
+  } else {
+    sqlite3_result_error(ctx,
+      "msgpack_timestamp: expected INTEGER (seconds) or REAL (seconds.nanoseconds)", -1);
+    return;
+  }
+  if( nsec==0 && sec>=0 && sec<=(i64)0xFFFFFFFFLL ){
+    /* ts32: fixext4, type=0xFF, 4-byte uint32 */
+    u8 b[6]; b[0]=MP_FIXEXT4; b[1]=(u8)MP_TIMESTAMP_TYPE;
+    mpWrite32(b+2, (u32)sec);
+    mpBufAppend(&buf, b, 6);
+  } else if( sec>=0 && sec<=(i64)0x3FFFFFFFFLL ){
+    /* ts64: fixext8, type=0xFF, nsec(30)|sec(34) packed into u64 */
+    u8 b[10]; b[0]=MP_FIXEXT8; b[1]=(u8)MP_TIMESTAMP_TYPE;
+    u64 v = ((u64)nsec << 34) | (u64)sec;
+    mpWrite64(b+2, v);
+    mpBufAppend(&buf, b, 10);
+  } else {
+    /* ts96: ext8 len=12, type=0xFF, 4-byte nsec + 8-byte sec */
+    u8 b[15]; b[0]=MP_EXT8; b[1]=12; b[2]=(u8)MP_TIMESTAMP_TYPE;
+    mpWrite32(b+3, nsec);
+    mpWrite64(b+7, (u64)sec);
+    mpBufAppend(&buf, b, 15);
+  }
+  mpReturnBuf(ctx, &buf);
+}
+
+/* ── msgpack_timestamp_s(mp) — extract whole seconds ──────────────── */
+static void msgpackTimestampSFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  const u8 *a;
+  u32 n;
+  i64 sec; u32 nsec;
+  (void)argc;
+  a = (const u8*)sqlite3_value_blob(argv[0]);
+  n = a ? (u32)sqlite3_value_bytes(argv[0]) : 0;
+  if( !a || !mpDecodeTimestamp(a, n, 0, &sec, &nsec) ){
+    sqlite3_result_error(ctx, "msgpack_timestamp_s: not a timestamp", -1);
+    return;
+  }
+  sqlite3_result_int64(ctx, sec);
+}
+
+/* ── msgpack_timestamp_ns(mp) — extract nanoseconds component ──────── */
+static void msgpackTimestampNsFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  const u8 *a;
+  u32 n;
+  i64 sec; u32 nsec;
+  (void)argc;
+  a = (const u8*)sqlite3_value_blob(argv[0]);
+  n = a ? (u32)sqlite3_value_bytes(argv[0]) : 0;
+  if( !a || !mpDecodeTimestamp(a, n, 0, &sec, &nsec) ){
+    sqlite3_result_error(ctx, "msgpack_timestamp_ns: not a timestamp", -1);
+    return;
+  }
+  sqlite3_result_int64(ctx, (i64)nsec);
+}
+
+/* ── msgpack_nil() → nil BLOB (0xc0) ──────────────────────────────────── */
+static void msgpackNilFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  static const u8 nilByte = MP_NIL;
+  (void)argc; (void)argv;
+  sqlite3_result_blob(ctx, &nilByte, 1, SQLITE_STATIC);
+}
+
+/* ── msgpack_true() / msgpack_false() ────────────────────────────────── */
+static void msgpackTrueFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  static const u8 trueByte = MP_TRUE;
+  (void)argc; (void)argv;
+  sqlite3_result_blob(ctx, &trueByte, 1, SQLITE_STATIC);
+}
+
+static void msgpackFalseFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  static const u8 falseByte = MP_FALSE;
+  (void)argc; (void)argv;
+  sqlite3_result_blob(ctx, &falseByte, 1, SQLITE_STATIC);
+}
+
+/* ── msgpack_bool(value) — integer 0 → false, non-zero → true ────────── */
+static void msgpackBoolFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  mpBufAppend1(&buf, sqlite3_value_int(argv[0]) ? MP_TRUE : MP_FALSE);
+  mpReturnBuf(ctx, &buf);
+}
+
+/* ── msgpack_float32(value) ──────────────────────────────────────────── */
+static void msgpackFloat32Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  float f;
+  u32 bits;
+  u8 b[5];
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  f = (float)sqlite3_value_double(argv[0]);
+  memcpy(&bits, &f, 4);
+  b[0] = MP_FLOAT32;
+  b[1] = (u8)(bits >> 24);
+  b[2] = (u8)(bits >> 16);
+  b[3] = (u8)(bits >>  8);
+  b[4] = (u8)(bits);
+  mpBufAppend(&buf, b, 5);
+  mpReturnBuf(ctx, &buf);
+}
+
+/* ── Fixed-width signed integers ─────────────────────────────────────── */
+static void msgpackInt8Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 x;
+  u8 b[2];
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  x = sqlite3_value_int64(argv[0]);
+  if( x < -128 || x > 127 ){
+    sqlite3_result_error(ctx, "msgpack_int8: value out of range [-128, 127]", -1);
+    return;
+  }
+  b[0] = MP_INT8; b[1] = (u8)(i64)x;
+  mpBufAppend(&buf, b, 2);
+  mpReturnBuf(ctx, &buf);
+}
+
+static void msgpackInt16Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 x;
+  u8 b[3];
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  x = sqlite3_value_int64(argv[0]);
+  if( x < -32768 || x > 32767 ){
+    sqlite3_result_error(ctx, "msgpack_int16: value out of range [-32768, 32767]", -1);
+    return;
+  }
+  b[0] = MP_INT16; mpWrite16(b+1, (u16)(i64)x);
+  mpBufAppend(&buf, b, 3);
+  mpReturnBuf(ctx, &buf);
+}
+
+static void msgpackInt32Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 x;
+  u8 b[5];
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  x = sqlite3_value_int64(argv[0]);
+  if( x < (i64)-2147483648LL || x > 2147483647LL ){
+    sqlite3_result_error(ctx, "msgpack_int32: value out of range [-2147483648, 2147483647]", -1);
+    return;
+  }
+  b[0] = MP_INT32; mpWrite32(b+1, (u32)(i64)x);
+  mpBufAppend(&buf, b, 5);
+  mpReturnBuf(ctx, &buf);
+}
+
+/* ── Fixed-width unsigned integers ───────────────────────────────────── */
+static void msgpackUint8Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 x;
+  u8 b[2];
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  x = sqlite3_value_int64(argv[0]);
+  if( x < 0 || x > 255 ){
+    sqlite3_result_error(ctx, "msgpack_uint8: value out of range [0, 255]", -1);
+    return;
+  }
+  b[0] = MP_UINT8; b[1] = (u8)x;
+  mpBufAppend(&buf, b, 2);
+  mpReturnBuf(ctx, &buf);
+}
+
+static void msgpackUint16Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 x;
+  u8 b[3];
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  x = sqlite3_value_int64(argv[0]);
+  if( x < 0 || x > 65535 ){
+    sqlite3_result_error(ctx, "msgpack_uint16: value out of range [0, 65535]", -1);
+    return;
+  }
+  b[0] = MP_UINT16; mpWrite16(b+1, (u16)x);
+  mpBufAppend(&buf, b, 3);
+  mpReturnBuf(ctx, &buf);
+}
+
+static void msgpackUint32Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 x;
+  u8 b[5];
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  x = sqlite3_value_int64(argv[0]);
+  if( x < 0 || x > (i64)0xffffffffLL ){
+    sqlite3_result_error(ctx, "msgpack_uint32: value out of range [0, 4294967295]", -1);
+    return;
+  }
+  b[0] = MP_UINT32; mpWrite32(b+1, (u32)x);
+  mpBufAppend(&buf, b, 5);
+  mpReturnBuf(ctx, &buf);
+}
+
+static void msgpackUint64Func(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  u8 b[9];
+  u64 x;
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  /* sqlite3_value_int64 returns a signed i64; reinterpret as u64.
+     Values > INT64_MAX arrive here as negative numbers from SQL but their
+     bit pattern is the correct u64. */
+  x = (u64)sqlite3_value_int64(argv[0]);
+  b[0] = MP_UINT64; mpWrite64(b+1, x);
+  mpBufAppend(&buf, b, 9);
+  mpReturnBuf(ctx, &buf);
+}
+
+/* ── msgpack_bin(blob) — always encode as msgpack bin, even if the input
+**   is itself valid msgpack (bypasses the auto-embed logic in msgpack_quote).
+** ─────────────────────────────────────────────────────────────────────── */
+static void msgpackBinFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  const u8 *z;
+  u32 n;
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  z = (const u8*)sqlite3_value_blob(argv[0]);
+  n = z ? (u32)sqlite3_value_bytes(argv[0]) : 0;
+  if( n <= 0xff ){
+    u8 b[2] = { MP_BIN8, (u8)n };
+    mpBufAppend(&buf, b, 2);
+  } else if( n <= 0xffff ){
+    u8 b[3]; b[0] = MP_BIN16; mpWrite16(b+1, (u16)n);
+    mpBufAppend(&buf, b, 3);
+  } else {
+    u8 b[5]; b[0] = MP_BIN32; mpWrite32(b+1, n);
+    mpBufAppend(&buf, b, 5);
+  }
+  if( z ) mpBufAppend(&buf, z, n);
+  mpReturnBuf(ctx, &buf);
+}
+
+/* ── msgpack_ext(type_code, blob) ────────────────────────────────────── */
+static void msgpackExtFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  MpBuf buf;
+  i64 tc;
+  const u8 *z;
+  u32 n;
+  (void)argc;
+  mpBufInit(&buf, ctx);
+  tc = sqlite3_value_int64(argv[0]);
+  if( tc < -128 || tc > 127 ){
+    sqlite3_result_error(ctx, "msgpack_ext: type_code must be in [-128, 127]", -1);
+    return;
+  }
+  z = (const u8*)sqlite3_value_blob(argv[1]);
+  n = z ? (u32)sqlite3_value_bytes(argv[1]) : 0;
+
+  /* Use fixext variants when data length is a power of two ≤ 16 */
+  if( n == 1 ){
+    u8 b[2] = { MP_FIXEXT1, (u8)tc }; mpBufAppend(&buf, b, 2);
+  } else if( n == 2 ){
+    u8 b[2] = { MP_FIXEXT2, (u8)tc }; mpBufAppend(&buf, b, 2);
+  } else if( n == 4 ){
+    u8 b[2] = { MP_FIXEXT4, (u8)tc }; mpBufAppend(&buf, b, 2);
+  } else if( n == 8 ){
+    u8 b[2] = { MP_FIXEXT8, (u8)tc }; mpBufAppend(&buf, b, 2);
+  } else if( n == 16 ){
+    u8 b[2] = { MP_FIXEXT16, (u8)tc }; mpBufAppend(&buf, b, 2);
+  } else if( n <= 0xff ){
+    u8 b[3] = { MP_EXT8, (u8)n, (u8)tc }; mpBufAppend(&buf, b, 3);
+  } else if( n <= 0xffff ){
+    u8 b[4]; b[0]=MP_EXT16; mpWrite16(b+1,(u16)n); b[3]=(u8)tc;
+    mpBufAppend(&buf, b, 4);
+  } else {
+    u8 b[6]; b[0]=MP_EXT32; mpWrite32(b+1,n); b[5]=(u8)tc;
+    mpBufAppend(&buf, b, 6);
+  }
+  if( z ) mpBufAppend(&buf, z, n);
+  mpReturnBuf(ctx, &buf);
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #elif defined(__GNUC__)
@@ -3114,6 +3656,76 @@ int sqlite3_msgpack_init(
   rc = sqlite3_create_function_v2(db, "msgpack_schema_validate", 2,
          SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
          0, msgpackSchemaValidateFunc, 0, 0, 0);
+  if( rc ) return rc;
+
+  /* Phase 9: Typed primitive constructors */
+  rc = sqlite3_create_function_v2(db, "msgpack_nil", 0,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackNilFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_true", 0,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackTrueFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_false", 0,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackFalseFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_bool", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackBoolFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_float32", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackFloat32Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_int8", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackInt8Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_int16", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackInt16Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_int32", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackInt32Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_uint8", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackUint8Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_uint16", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackUint16Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_uint32", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackUint32Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_uint64", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackUint64Func, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_bin", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackBinFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_ext", 2,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackExtFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_timestamp", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackTimestampFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_timestamp_s", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackTimestampSFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_timestamp_ns", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackTimestampNsFunc, 0, 0, 0);
   if( rc ) return rc;
 
   return SQLITE_OK;
