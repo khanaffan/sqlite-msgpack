@@ -31,6 +31,8 @@ deterministic and side-effect free (copy-on-write mutation).
    - [JSON conversion](#json-conversion)
    - [Aggregates](#aggregates)
    - [Table-valued functions](#table-valued-functions)
+   - [Typed constructors](#typed-constructors)
+   - [Timestamp](#timestamp)
    - [Schema validation](#schema-validation)
 7. [BLOB auto-embedding](#blob-auto-embedding)
 8. [MessagePack spec compliance](#messagepack-spec-compliance)
@@ -49,7 +51,8 @@ deterministic and side-effect free (copy-on-write mutation).
 sqlite3_load_extension(db, "./msgpack", NULL, &zErr);
 ```
 
-Once loaded, all `msgpack_*` functions and the two table-valued functions
+Once loaded, all `msgpack_*` functions (including typed constructors, timestamp
+helpers, and schema validation) and the two table-valued functions
 (`msgpack_each`, `msgpack_tree`) are available in every database connection.
 
 ---
@@ -77,6 +80,8 @@ The default build produces:
 |---|---|---|
 | `BUILD_SHARED_LIBS` | `ON` | Build the loadable extension |
 | `MSGPACK_BUILD_TESTS` | `ON` | Build and register CTest test targets |
+| `MSGPACK_BUILD_BENCH` | `OFF` | Build benchmark binaries and graph-generation targets |
+| `MSGPACK_BUILD_FUZZ` | `OFF` | Build fuzz-testing targets |
 
 ---
 
@@ -143,6 +148,8 @@ Each MessagePack element has a type string returned by `msgpack_type()`:
 | `blob`      | bin8, bin16, bin32 | BLOB |
 | `array`     | fixarray, array16, array32 | BLOB |
 | `map`       | fixmap, map16, map32 | BLOB |
+| `ext`       | fixext1/2/4/8/16, ext8, ext16, ext32 | BLOB |
+| `timestamp` | ext type −1 (ts32, ts64, ts96) | BLOB (use `msgpack_timestamp_s/ns` to decode) |
 
 > **Note on SQL booleans.** SQLite has no boolean type; `1=1` evaluates to
 > integer `1`. The `bool` type is only produced by `msgpack_from_json` when it
@@ -161,7 +168,7 @@ Each MessagePack element has a type string returned by `msgpack_type()`:
 Returns the extension version string.
 
 ```sql
-SELECT msgpack_version();  -- '1.0.0'
+SELECT msgpack_version();  -- '1.2.0'
 ```
 
 #### `msgpack_quote(value)`
@@ -433,6 +440,7 @@ Serializes a msgpack BLOB to a JSON text string. Type mapping:
 | array | `[...]` |
 | map | `{...}` |
 | ext | `null` |
+| timestamp (ext −1) | `null` (use `msgpack_timestamp_s/ns` for numeric access) |
 
 ```sql
 SELECT msgpack_to_json(msgpack_array(1, 'hi', NULL, true));
@@ -566,6 +574,142 @@ SELECT count(*)
 FROM msgpack_tree(msgpack_from_json('{"a":{"b":[1,2,3]}}'))
 WHERE type NOT IN ('array','map');
 -- 3
+```
+
+---
+
+### Typed constructors
+
+These functions create msgpack BLOBs with explicit control over the encoded
+type and width, bypassing the automatic "smallest encoding" and auto-embed
+rules used by `msgpack_quote`.
+
+#### `msgpack_nil()` / `msgpack_true()` / `msgpack_false()`
+
+Return single-byte msgpack BLOBs for the `nil`, `true`, and `false` constants.
+Unlike `msgpack_quote(NULL)`, these are explicit MessagePack types.
+
+```sql
+SELECT hex(msgpack_nil());    -- C0
+SELECT hex(msgpack_true());   -- C3
+SELECT hex(msgpack_false());  -- C2
+```
+
+#### `msgpack_bool(value)`
+
+Converts an integer to a msgpack boolean: `0` → `false` (`0xC2`),
+non-zero → `true` (`0xC3`).
+
+```sql
+SELECT hex(msgpack_bool(1));   -- C3  (true)
+SELECT hex(msgpack_bool(0));   -- C2  (false)
+```
+
+#### `msgpack_float32(value)`
+
+Encodes a number as a 32-bit IEEE 754 float (5 bytes), regardless of whether
+a more compact encoding exists.
+
+```sql
+SELECT hex(msgpack_float32(3.14));  -- CA4048F5C3
+SELECT hex(msgpack_float32(0));     -- CA00000000
+```
+
+#### `msgpack_int8(value)` / `msgpack_int16(value)` / `msgpack_int32(value)`
+
+Encode a signed integer in the specified fixed width. Raises an error if the
+value is out of range for the requested type.
+
+| Function | Range | msgpack bytes |
+|----------|-------|---------------|
+| `msgpack_int8` | −128 to 127 | 2 |
+| `msgpack_int16` | −32 768 to 32 767 | 3 |
+| `msgpack_int32` | −2 147 483 648 to 2 147 483 647 | 5 |
+
+```sql
+SELECT hex(msgpack_int8(-1));     -- D0FF
+SELECT hex(msgpack_int16(1000));  -- D103E8
+SELECT hex(msgpack_int32(100000));-- D2000186A0
+```
+
+#### `msgpack_uint8(value)` / `msgpack_uint16(value)` / `msgpack_uint32(value)` / `msgpack_uint64(value)`
+
+Encode an unsigned integer in the specified fixed width. Raises an error if
+the value is out of range.
+
+| Function | Range | msgpack bytes |
+|----------|-------|---------------|
+| `msgpack_uint8` | 0–255 | 2 |
+| `msgpack_uint16` | 0–65 535 | 3 |
+| `msgpack_uint32` | 0–4 294 967 295 | 5 |
+| `msgpack_uint64` | 0–2⁶⁴−1 | 9 |
+
+```sql
+SELECT hex(msgpack_uint8(200));    -- CC C8
+SELECT hex(msgpack_uint16(1000));  -- CD03E8
+SELECT hex(msgpack_uint64(42));    -- CF000000000000002A
+```
+
+#### `msgpack_bin(blob)`
+
+Encodes a BLOB as msgpack `bin` type, **bypassing** the auto-embed logic.
+Use this when you want to store raw bytes that happen to be valid msgpack
+without having them interpreted as a nested element.
+
+```sql
+-- msgpack_quote auto-embeds valid msgpack; msgpack_bin does not
+SELECT hex(msgpack_bin(x'2A'));         -- C4012A  (bin8, 1 byte)
+SELECT hex(msgpack_bin(x'DEADBEEF'));   -- C404DEADBEEF
+```
+
+#### `msgpack_ext(type_code, data)`
+
+Creates a msgpack extension type. `type_code` is a signed integer in
+\[−128, 127\]. Uses fixext formats when the data length is 1, 2, 4, 8, or 16
+bytes.
+
+```sql
+SELECT hex(msgpack_ext(1, x'AABB'));    -- D501AABB  (fixext2, type=1)
+SELECT hex(msgpack_ext(42, x'0102'));   -- D52A0102
+```
+
+---
+
+### Timestamp
+
+MessagePack defines an extension type (type code `−1`) for timestamps.
+These functions create and decode timestamp values.
+
+#### `msgpack_timestamp(seconds)`
+
+Creates a timestamp ext from a numeric value. Integer input is treated as
+whole seconds; real (float) input splits into seconds and nanoseconds.
+Automatically uses the most compact encoding (ts32, ts64, or ts96).
+
+```sql
+-- Integer seconds → ts32 (fixext4, 6 bytes)
+SELECT hex(msgpack_timestamp(1712345678));  -- D7FF660EA...
+
+-- Real seconds with fractional nanoseconds → ts64 (fixext8, 10 bytes)
+SELECT hex(msgpack_timestamp(1712345678.5));
+```
+
+#### `msgpack_timestamp_s(mp)`
+
+Extracts the whole-seconds component from a msgpack timestamp BLOB.
+
+```sql
+SELECT msgpack_timestamp_s(msgpack_timestamp(1712345678));     -- 1712345678
+SELECT msgpack_timestamp_s(msgpack_timestamp(1712345678.5));   -- 1712345678
+```
+
+#### `msgpack_timestamp_ns(mp)`
+
+Extracts the nanoseconds component (0–999 999 999) from a msgpack timestamp.
+
+```sql
+SELECT msgpack_timestamp_ns(msgpack_timestamp(1712345678));    -- 0
+SELECT msgpack_timestamp_ns(msgpack_timestamp(1712345678.5));  -- 500000000
 ```
 
 ---
@@ -1008,10 +1152,16 @@ in full:
 
 - **Smallest encoding rule** — values are always encoded in the most compact
   valid format (e.g., `42` uses positive fixint `0x2a`, not uint8 `0xcc 0x2a`).
+  Use the typed constructors (`msgpack_int8`, `msgpack_uint32`, etc.) when you
+  need a specific wire width.
 - **All 36 format families** — nil, bool, positive fixint, negative fixint,
   uint8/16/32/64, int8/16/32/64, float32/64, fixstr, str8/16/32,
   bin8/16/32, fixarray, array16/32, fixmap, map16/32, fixext1/2/4/8/16,
   ext8/16/32.
+- **Extension types** — arbitrary ext types via `msgpack_ext(type_code, data)`.
+- **Timestamp extension** — built-in support for the standard timestamp
+  extension type (type code −1) with ts32, ts64, and ts96 encodings via
+  `msgpack_timestamp()`.
 - **Copy-on-write mutation** — no in-place modification; every mutation
   returns a new BLOB.
 - **Never-used byte** — `0xc1` is treated as an error by `msgpack_valid`
