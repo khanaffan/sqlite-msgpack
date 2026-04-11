@@ -1032,24 +1032,24 @@ SQLite itself is in the [public domain](https://www.sqlite.org/copyright.html).
 
 > Nanoseconds per operation — lower is better.  
 > `json/mp` and `jsonb/mp`: ratio relative to msgpack (>1 means msgpack is faster).  
-> Platform: macOS · SQLite 3.53.0
+> Platform: macOS · SQLite 3.51.3
 
 | Operation                          | msgpack ns/op | json ns/op | jsonb ns/op |  json/mp |  jsonb/mp |
 |----------------------------------- |---------------|------------|-------------|----------|-----------|
-| map build (4 fields)               |         138.1 |      186.5 |       254.9 |    1.35x |     1.85x |
-| array build (8 integers)           |         113.1 |      158.9 |       202.4 |    1.40x |     1.79x |
-| nested build (map + array)         |         254.7 |      167.6 |       324.1 |    0.66x |     1.27x |
-| extract text field ($.name)        |         130.0 |      252.6 |       143.9 |    1.94x |     1.11x |
-| extract numeric field ($.score)    |         128.9 |      263.6 |       144.7 |    2.04x |     1.12x |
-| type check ($.name)                |         127.4 |      254.0 |         n/a |    1.99x |       n/a |
-| set field ($.extra = 42)           |         300.0 |      391.4 |       197.5 |    1.30x |     0.66x |
-| remove field ($.active)            |         240.5 |      328.7 |       165.1 |    1.37x |     0.69x |
-| group_array (1 000 rows)           |       22665.0 |    24658.3 |     30725.0 |    1.09x |     1.36x |
-| group_object (1 000 rows)          |       35120.0 |    36185.0 |     48598.3 |    1.03x |     1.38x |
-| each — iterate 4-field map       |        1108.8 |      292.3 |       234.6 |    0.26x |     0.21x |
-| valid check                        |         125.3 |      234.2 |         n/a |    1.87x |       n/a |
-| from_json (parse JSON text → blob) |         293.9 |        n/a |         n/a |      n/a |       n/a |
-| to_json (serialise blob → JSON text) |         305.2 |        n/a |         n/a |      n/a |       n/a |
+| map build (4 fields)               |         408.3 |     1168.3 |      1408.8 |    2.86x |     3.45x |
+| array build (8 integers)           |         328.9 |      584.9 |       757.7 |    1.78x |     2.30x |
+| nested build (map + array)         |         782.8 |      647.6 |      1218.1 |    0.83x |     1.56x |
+| extract text field ($.name)        |         573.9 |      944.6 |       649.3 |    1.65x |     1.13x |
+| extract numeric field ($.score)    |         577.2 |     1016.6 |       767.3 |    1.76x |     1.33x |
+| type check ($.name)                |         549.6 |      914.2 |         n/a |    1.66x |       n/a |
+| set field ($.extra = 42)           |         818.7 |     1590.7 |       950.1 |    1.94x |     1.16x |
+| remove field ($.active)            |         865.6 |     1218.0 |       719.8 |    1.41x |     0.83x |
+| group_array (1 000 rows)           |       88231.7 |   127026.7 |    142550.0 |    1.44x |     1.62x |
+| group_object (1 000 rows)          |      130031.7 |   184090.0 |    215260.0 |    1.42x |     1.66x |
+| each — iterate 4-field map       |        2986.1 |     1172.6 |      1004.0 |    0.39x |     0.34x |
+| valid check                        |         536.4 |      812.3 |         n/a |    1.51x |       n/a |
+| from_json (parse JSON text → blob) |        1000.6 |        n/a |         n/a |      n/a |       n/a |
+| to_json (serialise blob → JSON text) |        1588.2 |        n/a |         n/a |      n/a |       n/a |
 
 
 
@@ -1069,7 +1069,7 @@ and SQLite JSONB (binary).  `mp/json %` and `mp/jsonb %` show msgpack
 size as a percentage of the other format — below 100 % means msgpack
 is more compact.
 
-> Platform: macOS · SQLite 3.53.0
+> Platform: macOS · SQLite 3.51.3
 
 | Payload                                |  msgpack (B) |   json (B) |   jsonb (B) |  mp/json % |  mp/jsonb % |
 |--------------------------------------- |--------------|------------|-------------|------------|-------------|
