@@ -14,6 +14,13 @@ who has used `json_extract`, `json_set`, or `json_each`.
 MessagePack values are stored as ordinary SQLite `BLOB` columns. All functions are
 deterministic and side-effect free (copy-on-write mutation).
 
+A standalone **[C++ Blob API](docs/cpp-api.md)** is also provided for use outside
+SQLite — it supports all msgpack primitive types (including fixed-width integers,
+float32/64, ext, timestamp, and binary) and produces byte-identical blobs.  Full
+[interop tests](tests/test_interop.cpp) verify round-trip compatibility between
+the SQL and C++ APIs, and a [fuzz harness](tests/fuzz_msgpack_blob.cpp) exercises
+every public entry point with arbitrary byte sequences.
+
 ---
 
 ## Table of contents
@@ -38,6 +45,8 @@ deterministic and side-effect free (copy-on-write mutation).
 8. [MessagePack spec compliance](#messagepack-spec-compliance)
 9. [Performance benchmarks](#performance-benchmarks)
 10. [Serialised-size comparison](#serialised-size-comparison)
+11. [C++ Blob API](docs/cpp-api.md)
+12. [Testing](#testing)
 
 ---
 
@@ -1254,3 +1263,43 @@ is more compact.
 ![Serialised-size comparison](docs/size_comparison.png)
 
 <!-- SIZE_END -->
+
+---
+
+## Testing
+
+The project includes a comprehensive test suite covering both the SQL extension and the C++ API.
+
+```bash
+cmake -B build -DMSGPACK_BUILD_TESTS=ON
+cmake --build build
+cd build && ctest --output-on-failure
+```
+
+### Test targets
+
+| CTest target | Language | Tests | Description |
+|---|---|---|---|
+| `msgpack_unit` | C | 12 | Core SQLite extension unit tests |
+| `msgpack_sql` | SQL | — | SQL integration tests via CLI |
+| `msgpack_spec_p1`–`p10` | C | 10 suites | Per-section msgpack spec compliance |
+| `msgpack_blob_unit` | C++ | 289 | Standalone C++ API (no SQLite dependency) |
+| `msgpack_interop` | C++ | 197 | C++ ↔ SQLite interoperability |
+| `fuzz_corpus` | C | 94+ | Fuzz corpus against SQL extension |
+| `fuzz_blob_corpus` | C++ | 94+ | Fuzz corpus against C++ API |
+
+### Fuzz testing
+
+Both the SQL extension and C++ API have dedicated libFuzzer harnesses
+(`tests/fuzz_msgpack.c` and `tests/fuzz_msgpack_blob.cpp`).  Without libFuzzer,
+the corpus runners (`fuzz_corpus_runner` and `fuzz_blob_corpus_runner`) exercise
+the same code paths using 94+ seed files as part of the normal CTest suite.
+
+```bash
+# With libFuzzer (Clang required)
+cmake -B build-fuzz -DMSGPACK_BUILD_FUZZ=ON \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-fuzz
+./build-fuzz/fuzz_msgpack tests/fuzz_corpus -max_total_time=300
+./build-fuzz/fuzz_msgpack_blob tests/fuzz_corpus -max_total_time=300
+```
