@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sqlite_msgpack VERSION 1.0.1 LANGUAGES C)
+project(sqlite_msgpack VERSION 1.2.0 LANGUAGES C)
 
 # ── Options ──────────────────────────────────────────────────────────────────
 option(BUILD_SHARED_LIBS "Build msgpack as a loadable extension (.so/.dylib/.dll)" ON)
@@ -134,6 +134,8 @@ if(MSGPACK_BUILD_TESTS)
     add_msgpack_test(msgpack_spec_p6 test_spec_p6_json.c)
     add_msgpack_test(msgpack_spec_p7 test_spec_p7_agg_vtab.c)
     add_msgpack_test(msgpack_spec_p8 test_spec_p8_schema.c)
+    add_msgpack_test(msgpack_spec_p9 test_spec_p9_typed_primitives.c)
+    add_msgpack_test(msgpack_spec_p10 test_spec_p10_timestamp.c)
 
 endif()
 
