@@ -1,15 +1,68 @@
 /*
-** SQLite MessagePack Extension
+** SQLite MessagePack Extension — v1.2.0
 **
-** This file implements SQL functions for creating, querying, and manipulating
+** A full-featured SQLite extension for creating, querying, and manipulating
 ** MessagePack binary data (stored as BLOBs), mirroring the JSON1 extension API.
 **
-** Functions provided (Phase 1):
-**   msgpack_valid(mp)          -- 1 if well-formed msgpack, 0 otherwise
-**   msgpack_quote(value)       -- encode a single SQL value as msgpack BLOB
+** Functions provided:
 **
-** Build as loadable extension:
-**   gcc -shared -fPIC -o msgpack.dylib ext/msgpack/msgpack.c -I.
+**   Encoding & validation
+**     msgpack_version()                  -- extension version string
+**     msgpack_valid(mp [,path])          -- 1 if well-formed, 0 otherwise
+**     msgpack_error_position(mp)         -- byte offset of first error, or 0
+**     msgpack_quote(value)               -- encode a SQL value as msgpack BLOB
+**     msgpack(mp)                        -- validate and return unchanged
+**
+**   Construction
+**     msgpack_array(v1, v2, ...)         -- build array
+**     msgpack_object(k1, v1, ...)        -- build map
+**
+**   Extraction
+**     msgpack_extract(mp, path, ...)     -- extract element(s)
+**     msgpack_type(mp [,path])           -- type string
+**     msgpack_array_length(mp [,path])   -- element count
+**
+**   Mutation (copy-on-write)
+**     msgpack_set(mp, path, val, ...)    -- insert or replace
+**     msgpack_insert(mp, path, val, ...) -- insert only
+**     msgpack_replace(mp, path, val, ..) -- replace only
+**     msgpack_remove(mp, path, ...)      -- remove element(s)
+**     msgpack_array_insert(mp, path, v)  -- insert before index
+**     msgpack_patch(mp, patch)           -- RFC 7386 merge-patch
+**
+**   JSON conversion
+**     msgpack_from_json(json_text)       -- JSON → msgpack
+**     msgpack_to_json(mp)                -- msgpack → JSON text
+**     msgpack_to_jsonb(mp)               -- alias for msgpack_to_json
+**     msgpack_pretty(mp [,indent])       -- pretty-printed JSON
+**
+**   Typed constructors
+**     msgpack_nil() / msgpack_true() / msgpack_false()
+**     msgpack_bool(value)                -- integer → bool
+**     msgpack_float32(value)             -- force float32 encoding
+**     msgpack_int8/16/32(value)          -- fixed-width signed integers
+**     msgpack_uint8/16/32/64(value)      -- fixed-width unsigned integers
+**     msgpack_bin(blob)                  -- force bin encoding (no auto-embed)
+**     msgpack_ext(type_code, data)       -- extension type
+**
+**   Timestamp (ext type -1)
+**     msgpack_timestamp(seconds)         -- create timestamp from seconds
+**     msgpack_timestamp_s(mp)            -- extract whole seconds
+**     msgpack_timestamp_ns(mp)           -- extract nanoseconds component
+**
+**   Aggregates (also window functions)
+**     msgpack_group_array(value)         -- rows → array
+**     msgpack_group_object(key, value)   -- rows → map
+**
+**   Table-valued functions
+**     msgpack_each(mp [,path])           -- iterate direct children
+**     msgpack_tree(mp [,path])           -- recursive depth-first traversal
+**
+**   Schema validation
+**     msgpack_schema_validate(mp, schema) -- validate against schema
+**
+** Build:
+**   cmake -B build && cmake --build build
 **
 ** Usage in SQLite shell:
 **   .load ./msgpack
