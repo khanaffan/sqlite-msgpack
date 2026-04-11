@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sqlite_msgpack VERSION 1.2.0 LANGUAGES C)
+project(sqlite_msgpack VERSION 1.2.0 LANGUAGES C CXX)
 
 # ── Options ──────────────────────────────────────────────────────────────────
 option(BUILD_SHARED_LIBS "Build msgpack as a loadable extension (.so/.dylib/.dll)" ON)
@@ -79,6 +79,14 @@ add_library(msgpack_static STATIC src/msgpack.c)
 target_include_directories(msgpack_static PRIVATE include)
 target_compile_definitions(msgpack_static PRIVATE SQLITE_CORE)
 
+# ── Standalone C++ MsgPack Blob library (no SQLite dependency) ─────────────────
+add_library(msgpack_blob_static STATIC src/msgpack_blob.cpp)
+target_include_directories(msgpack_blob_static PUBLIC include)
+set_target_properties(msgpack_blob_static PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+if(NOT MSVC)
+    target_compile_options(msgpack_blob_static PRIVATE -Wall -Wextra)
+endif()
+
 # ── SQLite3 CLI shell ─────────────────────────────────────────────────────────
 add_executable(sqlite3_cli src/shell.c src/sqlite3.c)
 target_include_directories(sqlite3_cli PRIVATE include)
@@ -137,6 +145,26 @@ if(MSGPACK_BUILD_TESTS)
     add_msgpack_test(msgpack_spec_p9 test_spec_p9_typed_primitives.c)
     add_msgpack_test(msgpack_spec_p10 test_spec_p10_timestamp.c)
 
+    # C++ Blob API unit tests (standalone, no SQLite dependency)
+    add_executable(msgpack_blob_unit tests/test_msgpack_blob.cpp)
+    target_include_directories(msgpack_blob_unit PRIVATE include)
+    target_link_libraries(msgpack_blob_unit PRIVATE msgpack_blob_static)
+    set_target_properties(msgpack_blob_unit PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME msgpack_blob_unit COMMAND msgpack_blob_unit)
+    set_tests_properties(msgpack_blob_unit PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
+
+    # C++ ↔ SQLite interop integration tests
+    add_executable(msgpack_interop tests/test_interop.cpp)
+    target_include_directories(msgpack_interop PRIVATE include)
+    target_compile_definitions(msgpack_interop PRIVATE SQLITE_CORE)
+    target_link_libraries(msgpack_interop PRIVATE sqlite3_amalg msgpack_static msgpack_blob_static)
+    set_target_properties(msgpack_interop PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    if(NOT MSVC)
+        target_compile_options(msgpack_interop PRIVATE -w)
+    endif()
+    add_test(NAME msgpack_interop COMMAND msgpack_interop)
+    set_tests_properties(msgpack_interop PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
+
 endif()
 
 # ── Fuzz testing (requires Clang with libFuzzer support) ──────────────────────
@@ -152,6 +180,14 @@ if(MSGPACK_BUILD_FUZZ)
     target_platform_libs(fuzz_msgpack PRIVATE)
     target_compile_options(fuzz_msgpack PRIVATE -fsanitize=fuzzer,address -g)
     target_link_options(fuzz_msgpack PRIVATE -fsanitize=fuzzer,address)
+
+    # C++ API fuzz harness
+    add_executable(fuzz_msgpack_blob
+        tests/fuzz_msgpack_blob.cpp src/msgpack_blob.cpp)
+    target_include_directories(fuzz_msgpack_blob PRIVATE include)
+    set_target_properties(fuzz_msgpack_blob PROPERTIES CXX_STANDARD 17)
+    target_compile_options(fuzz_msgpack_blob PRIVATE -fsanitize=fuzzer,address -g)
+    target_link_options(fuzz_msgpack_blob PRIVATE -fsanitize=fuzzer,address)
 endif()
 
 # ── Fuzz corpus runner (no libFuzzer needed — runs corpus files directly) ─────
@@ -168,6 +204,18 @@ if(MSGPACK_BUILD_TESTS)
     add_test(NAME fuzz_corpus
         COMMAND fuzz_corpus_runner ${CMAKE_SOURCE_DIR}/tests/fuzz_corpus)
     set_tests_properties(fuzz_corpus PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
+
+    # C++ API corpus runner (no libFuzzer needed)
+    add_executable(fuzz_blob_corpus_runner
+        tests/fuzz_blob_corpus_runner.cpp tests/fuzz_msgpack_blob.cpp src/msgpack_blob.cpp)
+    target_include_directories(fuzz_blob_corpus_runner PRIVATE include)
+    set_target_properties(fuzz_blob_corpus_runner PROPERTIES CXX_STANDARD 17)
+    if(NOT MSVC)
+        target_compile_options(fuzz_blob_corpus_runner PRIVATE -w)
+    endif()
+    add_test(NAME fuzz_blob_corpus
+        COMMAND fuzz_blob_corpus_runner ${CMAKE_SOURCE_DIR}/tests/fuzz_corpus)
+    set_tests_properties(fuzz_blob_corpus PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
 endif()
 
 # ── Install headers ───────────────────────────────────────────────────────────
