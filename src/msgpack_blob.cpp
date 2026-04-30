@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <climits>
 
 namespace msgpack {
 
@@ -119,7 +120,12 @@ public:
 
 /* ── skip_one — skip one complete msgpack element ─────────────────── */
 
+static uint32_t skip_one_d(const uint8_t* a, uint32_t n, uint32_t i, int depth);
 static uint32_t skip_one(const uint8_t* a, uint32_t n, uint32_t i) {
+    return skip_one_d(a, n, i, 0);
+}
+static uint32_t skip_one_d(const uint8_t* a, uint32_t n, uint32_t i, int depth) {
+    if (depth > kMaxDepth) return 0;
     if (i >= n) return 0;
     uint8_t b = a[i++];
 
@@ -202,7 +208,7 @@ static uint32_t skip_one(const uint8_t* a, uint32_t n, uint32_t i) {
     if (b >= 0x90 && b <= 0x9f) {
         uint32_t count = b & 0x0f;
         for (uint32_t j = 0; j < count; j++) {
-            i = skip_one(a, n, i);
+            i = skip_one_d(a, n, i, depth + 1);
             if (!i) return 0;
         }
         return i;
@@ -212,8 +218,8 @@ static uint32_t skip_one(const uint8_t* a, uint32_t n, uint32_t i) {
     if (b >= 0x80 && b <= 0x8f) {
         uint32_t count = b & 0x0f;
         for (uint32_t j = 0; j < count; j++) {
-            i = skip_one(a, n, i); if (!i) return 0;
-            i = skip_one(a, n, i); if (!i) return 0;
+            i = skip_one_d(a, n, i, depth + 1); if (!i) return 0;
+            i = skip_one_d(a, n, i, depth + 1); if (!i) return 0;
         }
         return i;
     }
@@ -229,7 +235,7 @@ static uint32_t skip_one(const uint8_t* a, uint32_t n, uint32_t i) {
             count = read32(a + i); i += 4;
         }
         for (uint32_t j = 0; j < count; j++) {
-            i = skip_one(a, n, i);
+            i = skip_one_d(a, n, i, depth + 1);
             if (!i) return 0;
         }
         return i;
@@ -246,8 +252,8 @@ static uint32_t skip_one(const uint8_t* a, uint32_t n, uint32_t i) {
             count = read32(a + i); i += 4;
         }
         for (uint32_t j = 0; j < count; j++) {
-            i = skip_one(a, n, i); if (!i) return 0;
-            i = skip_one(a, n, i); if (!i) return 0;
+            i = skip_one_d(a, n, i, depth + 1); if (!i) return 0;
+            i = skip_one_d(a, n, i, depth + 1); if (!i) return 0;
         }
         return i;
     }
@@ -1499,7 +1505,7 @@ static void tree_walk(
     const std::string& zFull, const std::string& zParPath,
     int depth, std::vector<EachRow>& rows
 ) {
-    if (depth > 64 || iOff >= n) return;
+    if (depth > kMaxDepth || iOff >= n) return;
     uint32_t iEnd = skip_one(a, n, iOff);
     if (!iEnd) return;
 
@@ -1633,7 +1639,9 @@ std::string_view Value::as_string() const noexcept {
     return {};
 }
 
-const uint8_t* Value::blob_data() const noexcept { return blob_ptr_; }
+const uint8_t* Value::blob_data() const noexcept {
+    return !owned_blob_.empty() ? owned_blob_.data() : blob_ptr_;
+}
 size_t Value::blob_size() const noexcept { return blob_len_; }
 
 Value Value::nil() {
@@ -1649,7 +1657,12 @@ Value Value::integer(int64_t x) {
 }
 
 Value Value::unsigned_integer(uint64_t x) {
-    Value v; v.type_ = Type::Integer; v.u64_ = x; return v;
+    Value v; v.type_ = Type::Integer; v.u64_ = x;
+    /* Values that don't fit in int64 must be encoded as unsigned to round-trip. */
+    if (x > static_cast<uint64_t>(INT64_MAX)) {
+        v.int_width_ = IntWidth::Uint64;
+    }
+    return v;
 }
 
 Value Value::real(double d) {
@@ -1665,7 +1678,16 @@ Value Value::string(std::string_view s) {
 }
 
 Value Value::binary(const uint8_t* data, size_t len) {
-    Value v; v.type_ = Type::Binary; v.blob_ptr_ = data; v.blob_len_ = len; return v;
+    Value v;
+    v.type_ = Type::Binary;
+    if (len > 0 && data) {
+        v.owned_blob_.assign(data, data + len);
+        v.blob_ptr_ = v.owned_blob_.data();
+    } else {
+        v.blob_ptr_ = nullptr;
+    }
+    v.blob_len_ = len;
+    return v;
 }
 
 Value Value::ext(int8_t type_code, const uint8_t* data, size_t len) {

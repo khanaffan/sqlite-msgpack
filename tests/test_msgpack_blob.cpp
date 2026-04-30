@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <vector>
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1239,6 +1240,162 @@ static void test_ext_extraction() {
     }
 }
 
+/* ── Robustness / regression tests ────────────────────────────────── */
+
+static void test_depth_limit_validation() {
+    using namespace msgpack;
+
+    /* 250 nested arrays (deeper than kMaxDepth=200) — must be rejected,
+    ** not crash the process (regression test for skip_one stack overflow). */
+    std::vector<uint8_t> deep;
+    deep.reserve(260);
+    for (int i = 0; i < 250; ++i) deep.push_back(0x91);
+    deep.push_back(0xc0); /* nil at the bottom */
+    Blob bad(deep.data(), deep.size());
+    CHECK(!bad.valid(), "250-level nest rejected (no stack overflow)");
+
+    /* Pathological all-fixarray-1 chain with no terminator — must reject. */
+    std::vector<uint8_t> open(10000, 0x91);
+    Blob noTerm(open.data(), open.size());
+    CHECK(!noTerm.valid(), "10000 unterminated arrays rejected");
+
+    /* A blob just under the limit (kMaxDepth=200) should still validate. */
+    Builder b;
+    for (int i = 0; i < 199; ++i) b.array_header(1);
+    b.integer(7);
+    Blob ok = b.build();
+    CHECK(ok.valid(), "199-level nest accepted");
+}
+
+static void test_value_binary_lifetime() {
+    using namespace msgpack;
+
+    /* Regression: Value::binary used to store a raw pointer. After the
+    ** source Blob is destroyed, blob_data() must still return valid bytes. */
+    Value v;
+    {
+        uint8_t payload[] = {1, 2, 3, 4, 5};
+        Blob src = Builder::quote(Value::binary(payload, 5));
+        v = src.extract("$");
+    }
+    CHECK(v.type() == Type::Binary, "binary type after source destroyed");
+    CHECK_EQ_INT(v.blob_size(), 5u, "binary size preserved");
+    const uint8_t* d = v.blob_data();
+    CHECK(d != nullptr, "binary data pointer non-null");
+    CHECK(d[0] == 1 && d[4] == 5, "binary bytes preserved after copy");
+
+    /* Copy of the Value must remain valid even after the original is
+    ** destroyed (blob_data() must derive from owned_blob_, not blob_ptr_). */
+    Value copy;
+    {
+        uint8_t payload2[] = {0xaa, 0xbb};
+        Value original = Value::binary(payload2, 2);
+        copy = original;
+    }
+    CHECK_EQ_INT(copy.blob_size(), 2u, "copied Value size");
+    CHECK(copy.blob_data()[0] == 0xaa && copy.blob_data()[1] == 0xbb,
+          "copied Value bytes survive original");
+}
+
+static void test_error_position() {
+    using namespace msgpack;
+
+    /* str8 with length=5 but only 2 payload bytes — invalid */
+    {
+        uint8_t bad[] = {0xd9, 0x05, 'a', 'b'};
+        Blob blob(bad, sizeof(bad));
+        CHECK(!blob.valid(), "truncated str8 invalid");
+        /* Just ensure it returns without crashing; offset must be inside blob */
+        size_t pos = blob.error_position();
+        CHECK(pos <= blob.size(), "error_position within blob");
+    }
+    /* Valid blob: error_position should be 0 */
+    {
+        Blob ok = Builder::quote(Value::integer(7));
+        CHECK_EQ_INT(ok.error_position(), 0u, "valid blob error_position == 0");
+    }
+}
+
+static void test_iterator_reset() {
+    using namespace msgpack;
+
+    Blob arr = make_array();
+    Iterator it(arr, "$", false);
+
+    int count1 = 0;
+    while (it.next()) count1++;
+    CHECK_EQ_INT(count1, 3, "iterator first pass count");
+
+    /* Without reset, next() must return false */
+    CHECK(!it.next(), "iterator exhausted after first pass");
+
+    it.reset();
+    int count2 = 0;
+    while (it.next()) count2++;
+    CHECK_EQ_INT(count2, 3, "iterator second pass count after reset");
+}
+
+static void test_iterator_empty_containers() {
+    using namespace msgpack;
+
+    /* Empty array */
+    {
+        Builder b; b.array_header(0);
+        Blob empty = b.build();
+        CHECK(empty.valid(), "empty array valid");
+        Iterator it(empty);
+        CHECK(!it.next(), "empty array iterator yields nothing");
+    }
+    /* Empty map */
+    {
+        Builder b; b.map_header(0);
+        Blob empty = b.build();
+        CHECK(empty.valid(), "empty map valid");
+        Iterator it(empty);
+        CHECK(!it.next(), "empty map iterator yields nothing");
+    }
+}
+
+static void test_unsigned_integer_value_and_builder() {
+    using namespace msgpack;
+
+    /* Builder::unsigned_integer encodes a value > INT64_MAX as MP_UINT64 */
+    Builder b;
+    b.unsigned_integer(0x8000000000000001ULL);
+    Blob blob = b.build();
+    CHECK(blob.valid(), "unsigned_integer blob valid");
+    CHECK(blob.size() == 9, "uint64 blob 9 bytes");
+    CHECK(blob.data()[0] == 0xcf, "uint64 leading byte 0xcf");
+
+    /* Value::unsigned_integer factory + as_uint64 round-trip */
+    Value v = Value::unsigned_integer(0xFFFFFFFFFFFFFFFFULL);
+    CHECK(v.type() == Type::Integer, "unsigned_integer Value::type == Integer");
+    CHECK(v.as_uint64() == 0xFFFFFFFFFFFFFFFFULL, "uint64 max round-trip");
+
+    Blob big = Builder::quote(v);
+    CHECK(big.valid(), "uint64 max blob valid");
+    CHECK(big.size() == 9, "uint64 max blob 9 bytes");
+    Value rt = big.extract("$");
+    CHECK(rt.as_uint64() == 0xFFFFFFFFFFFFFFFFULL, "uint64 max extracted");
+}
+
+static void test_value_as_float() {
+    using namespace msgpack;
+
+    /* Builder::real32 + extract → Value::as_float() */
+    Builder b; b.real32(1.5f);
+    Blob blob = b.build();
+    Value v = blob.extract("$");
+    CHECK(v.type() == Type::Float32, "real32 extracts as Float32");
+    CHECK(std::fabs(v.as_float() - 1.5f) < 1e-6f, "as_float round-trip");
+
+    /* Float64 path: as_float should narrow safely */
+    Builder b2; b2.real(2.25);
+    Value v2 = b2.build().extract("$");
+    CHECK(v2.type() == Type::Real, "real extracts as Real");
+    CHECK(std::fabs(v2.as_float() - 2.25f) < 1e-6f, "as_float from double");
+}
+
 /* ── main ─────────────────────────────────────────────────────────── */
 
 int main() {
@@ -1265,6 +1422,13 @@ int main() {
     test_fixed_width_integers();
     test_binary_extraction();
     test_ext_extraction();
+    test_depth_limit_validation();
+    test_value_binary_lifetime();
+    test_error_position();
+    test_iterator_reset();
+    test_iterator_empty_containers();
+    test_unsigned_integer_value_and_builder();
+    test_value_as_float();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

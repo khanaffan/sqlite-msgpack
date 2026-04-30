@@ -73,8 +73,8 @@
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
-#define SQLITE_MSGPACK_VERSION       "1.2.0"
-#define SQLITE_MSGPACK_VERSION_NUMBER 1002000  /* major*1000000 + minor*1000 + patch */
+#define SQLITE_MSGPACK_VERSION       "1.4.0"
+#define SQLITE_MSGPACK_VERSION_NUMBER 1004000  /* major*1000000 + minor*1000 + patch */
 
 #include <stdint.h>
 #include <string.h>
@@ -390,8 +390,13 @@ static void mpEncodeSqlValue(MpBuf *p, sqlite3_value *v){
 ** in blob (a, n). Returns offset of next element, or 0 on error.
 ** ============================================================
 */
+static u32 mpSkipOneD(const u8 *a, u32 n, u32 i, int depth);
 static u32 mpSkipOne(const u8 *a, u32 n, u32 i){
+  return mpSkipOneD(a, n, i, 0);
+}
+static u32 mpSkipOneD(const u8 *a, u32 n, u32 i, int depth){
   u32 count, j;
+  if( depth > MP_MAX_DEPTH ) return 0;
   if( i >= n ) return 0;
   u8 b = a[i++];
 
@@ -459,25 +464,25 @@ static u32 mpSkipOne(const u8 *a, u32 n, u32 i){
     case MP_ARRAY16:
       if( i+2 > n ) return 0;
       count = mpRead16(a+i); i+=2;
-      for( j=0; j<count; j++ ){ i = mpSkipOne(a,n,i); if(!i&&j<count-1) return 0; }
+      for( j=0; j<count; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count-1) return 0; }
       return i;
     /* array32 */
     case MP_ARRAY32:
       if( i+4 > n ) return 0;
       count = mpRead32(a+i); i+=4;
-      for( j=0; j<count; j++ ){ i = mpSkipOne(a,n,i); if(!i&&j<count-1) return 0; }
+      for( j=0; j<count; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count-1) return 0; }
       return i;
     /* map16 */
     case MP_MAP16:
       if( i+2 > n ) return 0;
       count = mpRead16(a+i); i+=2;
-      for( j=0; j<count*2; j++ ){ i = mpSkipOne(a,n,i); if(!i&&j<count*2-1) return 0; }
+      for( j=0; j<count*2; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count*2-1) return 0; }
       return i;
     /* map32 */
     case MP_MAP32:
       if( i+4 > n ) return 0;
       count = mpRead32(a+i); i+=4;
-      for( j=0; j<count*2; j++ ){ i = mpSkipOne(a,n,i); if(!i&&j<count*2-1) return 0; }
+      for( j=0; j<count*2; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count*2-1) return 0; }
       return i;
 
     default:
@@ -489,13 +494,13 @@ static u32 mpSkipOne(const u8 *a, u32 n, u32 i){
   /* fixmap: 0x80-0x8f */
   if( (b & 0xf0) == 0x80 ){
     count = b & 0x0f;
-    for( j=0; j<count*2; j++ ){ i = mpSkipOne(a,n,i); if(!i&&j<count*2-1) return 0; }
+    for( j=0; j<count*2; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count*2-1) return 0; }
     return i;
   }
   /* fixarray: 0x90-0x9f */
   if( (b & 0xf0) == 0x90 ){
     count = b & 0x0f;
-    for( j=0; j<count; j++ ){ i = mpSkipOne(a,n,i); if(!i&&j<count-1) return 0; }
+    for( j=0; j<count; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count-1) return 0; }
     return i;
   }
   /* fixstr: 0xa0-0xbf */

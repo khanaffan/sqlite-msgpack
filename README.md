@@ -68,7 +68,9 @@ helpers, and schema validation) and the two table-valued functions
 
 ## Building from source
 
-Requires **CMake ≥ 3.16** and a C99 compiler (GCC, Clang, or MSVC).
+Requires **CMake ≥ 3.16** and a **C11** and **C++17** compiler (GCC, Clang, or MSVC).
+The SQLite extension itself compiles with C99; C++17 is required for the
+standalone C++ Blob library and its tests.
 
 ```bash
 cmake -B build
@@ -1176,6 +1178,24 @@ in full:
 - **Never-used byte** — `0xc1` is treated as an error by `msgpack_valid`
   and `msgpack_error_position`.
 
+### Limits and robustness
+
+The implementation enforces the following hard limits to keep operations on
+untrusted blobs bounded:
+
+| Limit | Value | Applies to |
+|---|---|---|
+| Maximum nesting depth | **200** | Validation, JSON conversion, schema validation, merge-patch, iteration |
+| Maximum output buffer | **64 MB** | Encoding, JSON conversion, mutation results |
+
+Inputs that exceed these limits are rejected as invalid rather than
+processed (validation returns false, mutating operations raise an SQL
+error). All decoding paths are bounds-checked: malformed, truncated, or
+adversarially deeply-nested blobs cannot crash the process or read out of
+bounds. The fuzz corpus exercises these adversarial cases (see
+[Testing](#testing)). For the security model and reporting policy see
+[SECURITY.md](SECURITY.md).
+
 ---
 
 ## License
@@ -1280,20 +1300,22 @@ cd build && ctest --output-on-failure
 
 | CTest target | Language | Tests | Description |
 |---|---|---|---|
-| `msgpack_unit` | C | 12 | Core SQLite extension unit tests |
+| `msgpack_unit` | C | 29 | Core SQLite extension unit tests |
 | `msgpack_sql` | SQL | — | SQL integration tests via CLI |
 | `msgpack_spec_p1`–`p10` | C | 10 suites | Per-section msgpack spec compliance |
-| `msgpack_blob_unit` | C++ | 289 | Standalone C++ API (no SQLite dependency) |
+| `msgpack_blob_unit` | C++ | 320 | Standalone C++ API (no SQLite dependency) |
 | `msgpack_interop` | C++ | 197 | C++ ↔ SQLite interoperability |
-| `fuzz_corpus` | C | 94+ | Fuzz corpus against SQL extension |
-| `fuzz_blob_corpus` | C++ | 94+ | Fuzz corpus against C++ API |
+| `fuzz_corpus` | C | 100+ | Fuzz corpus against SQL extension |
+| `fuzz_blob_corpus` | C++ | 100+ | Fuzz corpus against C++ API |
 
 ### Fuzz testing
 
 Both the SQL extension and C++ API have dedicated libFuzzer harnesses
 (`tests/fuzz_msgpack.c` and `tests/fuzz_msgpack_blob.cpp`).  Without libFuzzer,
 the corpus runners (`fuzz_corpus_runner` and `fuzz_blob_corpus_runner`) exercise
-the same code paths using 94+ seed files as part of the normal CTest suite.
+the same code paths using 100+ seed files (including adversarially deep
+nesting, truncated length prefixes, and reserved-byte inputs) as part of the
+normal CTest suite.
 
 ```bash
 # With libFuzzer (Clang required)
