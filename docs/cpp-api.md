@@ -112,6 +112,22 @@ enum class IntWidth {
 };
 ```
 
+### Limits
+
+The C++ API enforces the same hard limits as the SQLite extension so blobs are
+fully interchangeable:
+
+```cpp
+namespace msgpack {
+    constexpr int    kMaxDepth  = 200;             // max container nesting
+    constexpr size_t kMaxOutput = 64 * 1024 * 1024; // 64 MB
+}
+```
+
+`Blob::valid()` returns `false` for inputs that exceed `kMaxDepth`, protecting
+against adversarial deeply-nested blobs (no stack overflow). All decoding is
+bounds-checked: malformed or truncated input is rejected, never crashes.
+
 ---
 
 ## Value
@@ -148,7 +164,7 @@ Value::unsigned_integer(uint64_t)   // compact encoding
 Value::real(double)                 // float64
 Value::real32(float)                // float32
 Value::string(std::string_view)
-Value::binary(const uint8_t*, size_t)
+Value::binary(const uint8_t*, size_t)   // bytes are copied; safe after src dies
 Value::ext(int8_t type, const uint8_t* data, size_t len)
 Value::timestamp(int64_t sec)
 Value::timestamp(int64_t sec, uint32_t nsec)

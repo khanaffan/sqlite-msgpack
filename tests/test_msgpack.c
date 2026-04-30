@@ -219,6 +219,43 @@ static void test_vtab(sqlite3 *db) {
     sqlite3_free(r);
 }
 
+/* ---- Misc / regression tests -------------------------------------------- */
+static void test_misc(sqlite3 *db) {
+    /* msgpack_version() returns a non-empty string */
+    char *r = exec1(db, "SELECT msgpack_version()");
+    CHECK("8.1 version non-empty", r && r[0] != '\0');
+    sqlite3_free(r);
+
+    /* msgpack_pretty(blob, indent) — indent of 4 produces a longer string
+    ** than indent of 0 for the same compound input. */
+    char *p0 = exec1(db,
+        "SELECT msgpack_pretty(msgpack_array(1,2,3), 0)");
+    char *p4 = exec1(db,
+        "SELECT msgpack_pretty(msgpack_array(1,2,3), 4)");
+    CHECK("8.2 pretty(0) ok", p0 && strlen(p0) > 0);
+    CHECK("8.3 pretty(4) ok", p4 && strlen(p4) > strlen(p0 ? p0 : ""));
+    sqlite3_free(p0);
+    sqlite3_free(p4);
+
+    /* Regression: deeply-nested input must be rejected, not crash.
+    ** Build a 250-deep array of fixarray(1) headers with a nil at the bottom. */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "WITH RECURSIVE r(b, k) AS ("
+            "  SELECT CAST(x'c0' AS BLOB), 0 "
+            "  UNION ALL "
+            "  SELECT CAST(x'91' AS BLOB) || b, k+1 FROM r WHERE k < 250 "
+            ") SELECT msgpack_valid(b) FROM r WHERE k=250",
+            -1, &st, NULL) == SQLITE_OK) {
+        int valid = -1;
+        if (sqlite3_step(st) == SQLITE_ROW) valid = sqlite3_column_int(st, 0);
+        CHECK("8.4 deep-nest rejected (no crash)", valid == 0);
+        sqlite3_finalize(st);
+    } else {
+        CHECK("8.4 deep-nest prepare ok", 0);
+    }
+}
+
 /* ---- Main ----------------------------------------------------------------- */
 int main(void) {
     sqlite3 *db = NULL;
@@ -252,6 +289,7 @@ int main(void) {
     test_json(db);
     test_aggregates(db);
     test_vtab(db);
+    test_misc(db);
 
     sqlite3_close(db);
 
