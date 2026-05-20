@@ -1,5 +1,5 @@
 /*
-** SQLite MessagePack Extension — v1.2.0
+** SQLite MessagePack Extension — v1.5.0
 **
 ** A full-featured SQLite extension for creating, querying, and manipulating
 ** MessagePack binary data (stored as BLOBs), mirroring the JSON1 extension API.
