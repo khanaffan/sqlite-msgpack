@@ -476,12 +476,14 @@ static u32 mpSkipOneD(const u8 *a, u32 n, u32 i, int depth){
     case MP_MAP16:
       if( i+2 > n ) return 0;
       count = mpRead16(a+i); i+=2;
+      if( count > (u32)0xFFFFFFFF/2 ) return 0;
       for( j=0; j<count*2; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count*2-1) return 0; }
       return i;
     /* map32 */
     case MP_MAP32:
       if( i+4 > n ) return 0;
       count = mpRead32(a+i); i+=4;
+      if( count > (u32)0xFFFFFFFF/2 ) return 0;
       for( j=0; j<count*2; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count*2-1) return 0; }
       return i;
 

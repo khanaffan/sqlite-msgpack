@@ -1211,7 +1211,7 @@ SQLite itself is in the [public domain](https://www.sqlite.org/copyright.html).
 
 > Nanoseconds per operation — lower is better.  
 > `json/mp` and `jsonb/mp`: ratio relative to msgpack (>1 means msgpack is faster).  
-> Platform: macOS · SQLite 3.51.3
+> Platform: macOS · SQLite 3.53.1
 
 | Operation                          | msgpack ns/op | json ns/op | jsonb ns/op |  json/mp |  jsonb/mp |
 |----------------------------------- |---------------|------------|-------------|----------|-----------|
@@ -1248,7 +1248,7 @@ and SQLite JSONB (binary).  `mp/json %` and `mp/jsonb %` show msgpack
 size as a percentage of the other format — below 100 % means msgpack
 is more compact.
 
-> Platform: macOS · SQLite 3.51.3
+> Platform: macOS · SQLite 3.53.1
 
 | Payload                                |  msgpack (B) |   json (B) |   jsonb (B) |  mp/json % |  mp/jsonb % |
 |--------------------------------------- |--------------|------------|-------------|------------|-------------|

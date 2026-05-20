@@ -484,6 +484,99 @@ static void test_multi_path_extract(sqlite3 *db){
   sqlite3_free(blob);
 }
 
+/* ── overflow edge-case tests for MAP32 validation ──────────── */
+
+static void test_map_overflow_validation(sqlite3 *db){
+  /*
+  ** Craft malformed MAP32 blobs with counts that would overflow count*2
+  ** in the validation loop. These must all be rejected as invalid.
+  */
+
+  /* MAP32 with count = 0x80000000 (count*2 overflows to 0) */
+  {
+    unsigned char bad1[] = {
+      0xDF,                       /* MAP32 format byte */
+      0x80, 0x00, 0x00, 0x00     /* count = 2147483648 */
+    };
+    CHECK("11.1 MAP32 count=0x80000000 rejected",
+      blob_valid(db, bad1, sizeof(bad1)) == 0);
+  }
+
+  /* MAP32 with count = 0x80000001 (count*2 wraps to 2) */
+  {
+    unsigned char bad2[] = {
+      0xDF,                       /* MAP32 format byte */
+      0x80, 0x00, 0x00, 0x01,    /* count = 2147483649 */
+      0x01, 0x02                  /* 2 elements (would pass if overflow) */
+    };
+    CHECK("11.2 MAP32 count=0x80000001 rejected",
+      blob_valid(db, bad2, sizeof(bad2)) == 0);
+  }
+
+  /* MAP32 with count = 0xFFFFFFFF (max u32, count*2 wraps to 0xFFFFFFFE) */
+  {
+    unsigned char bad3[] = {
+      0xDF,                       /* MAP32 format byte */
+      0xFF, 0xFF, 0xFF, 0xFF     /* count = 4294967295 */
+    };
+    CHECK("11.3 MAP32 count=0xFFFFFFFF rejected",
+      blob_valid(db, bad3, sizeof(bad3)) == 0);
+  }
+
+  /* MAP32 with count = 0x7FFFFFFF (just below overflow threshold — still too large for data) */
+  {
+    unsigned char bad4[] = {
+      0xDF,                       /* MAP32 format byte */
+      0x7F, 0xFF, 0xFF, 0xFF     /* count = 2147483647 */
+    };
+    CHECK("11.4 MAP32 count=0x7FFFFFFF rejected (no data)",
+      blob_valid(db, bad4, sizeof(bad4)) == 0);
+  }
+
+  /* ARRAY32 with count = 0xFFFFFFFF (should be rejected — not enough data) */
+  {
+    unsigned char bad5[] = {
+      0xDD,                       /* ARRAY32 format byte */
+      0xFF, 0xFF, 0xFF, 0xFF     /* count = 4294967295 */
+    };
+    CHECK("11.5 ARRAY32 count=0xFFFFFFFF rejected",
+      blob_valid(db, bad5, sizeof(bad5)) == 0);
+  }
+
+  /* MAP16 with count = 0xFFFF (65535 pairs — not enough data) */
+  {
+    unsigned char bad6[] = {
+      0xDE,                       /* MAP16 format byte */
+      0xFF, 0xFF                  /* count = 65535 */
+    };
+    CHECK("11.6 MAP16 count=0xFFFF rejected (no data)",
+      blob_valid(db, bad6, sizeof(bad6)) == 0);
+  }
+
+  /* Valid MAP32 with count=1 (one key-value pair) — should pass */
+  {
+    unsigned char ok1[] = {
+      0xDF,                       /* MAP32 format byte */
+      0x00, 0x00, 0x00, 0x01,    /* count = 1 */
+      0xA1, 0x61,                 /* fixstr "a" (key) */
+      0x01                        /* fixint 1 (value) */
+    };
+    CHECK("11.7 MAP32 count=1 with valid data accepted",
+      blob_valid(db, ok1, sizeof(ok1)) == 1);
+  }
+
+  /* Valid ARRAY32 with count=1 */
+  {
+    unsigned char ok2[] = {
+      0xDD,                       /* ARRAY32 format byte */
+      0x00, 0x00, 0x00, 0x01,    /* count = 1 */
+      0x2A                        /* fixint 42 */
+    };
+    CHECK("11.8 ARRAY32 count=1 with valid data accepted",
+      blob_valid(db, ok2, sizeof(ok2)) == 1);
+  }
+}
+
 static void test_array_length_with_path(sqlite3 *db){
   /* msgpack_array_length(blob, path) — navigate then measure */
   int n = 0; unsigned char *blob = build_blob(db,
@@ -525,6 +618,7 @@ int main(void){
   test_msgpack_func(db);
   test_auto_embed(db);
   test_multi_path_extract(db);
+  test_map_overflow_validation(db);
   test_array_length_with_path(db);
 
   sqlite3_close(db);
