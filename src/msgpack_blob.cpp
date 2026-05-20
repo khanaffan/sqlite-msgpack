@@ -972,6 +972,8 @@ static int merge_patch(
         uint32_t keyOff, valOff, pairEnd;
         bool matched;
     };
+    /* Sanity: each map pair needs at least 2 bytes; reject implausible counts */
+    if (pCount > (np - pDataOff) / 2 + 1) return RC_ERROR;
     std::vector<PatchEntry> pIdx(pCount);
     {
         uint32_t pc2 = pDataOff;
@@ -1458,6 +1460,12 @@ static void each_iter(
     else if (b == MP_MAP32 && iCont + 5 <= n) { isMap = true; count = read32(a + iCont + 1); dataOff = iCont + 5; }
 
     if (!isArr && !isMap) return;
+
+    /* Sanity: reject counts that exceed remaining data capacity */
+    uint32_t remaining = (dataOff <= n) ? (n - dataOff) : 0;
+    uint32_t minBytesPerElem = isMap ? 2u : 1u;
+    if (count > remaining / minBytesPerElem + 1) return;
+
     uint32_t cur = dataOff;
 
     for (uint32_t j = 0; j < count; j++) {
@@ -1532,6 +1540,12 @@ static void tree_walk(
     else if (b == MP_MAP32 && iOff + 5 <= n) { isMap = true; count = read32(a + iOff + 1); dataOff = iOff + 5; }
 
     if (!isArr && !isMap) return;
+
+    /* Sanity: reject counts that exceed remaining data capacity */
+    uint32_t tRemaining = (dataOff <= n) ? (n - dataOff) : 0;
+    uint32_t tMinBytes = isMap ? 2u : 1u;
+    if (count > tRemaining / tMinBytes + 1) return;
+
     uint32_t cur = dataOff;
 
     for (uint32_t j = 0; j < count; j++) {
