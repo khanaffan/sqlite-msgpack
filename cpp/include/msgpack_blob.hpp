@@ -242,10 +242,34 @@ public:
     Builder& timestamp(int64_t sec);
     Builder& timestamp(int64_t sec, uint32_t nsec);
 
+    /* Buffer reuse — encode many blobs with one Builder, no re-malloc.
+    **
+    ** reset() rewinds the Builder to empty but KEEPS the heap allocation, so a
+    ** single Builder can encode blob after blob inside a hot loop without
+    ** reallocating. Pair it with the zero-copy buf_data()/buf_size() accessors
+    ** to emit each encoded blob without ever copying or allocating:
+    **
+    **     Builder b;
+    **     b.reserve(64);                 // optional: pre-size to skip warm-up
+    **     for (auto& item : items) {     // grows on heap
+    **         b.reset();                 // rewind, keep capacity
+    **         b.map_header(2)
+    **          .string("id").integer(item.id)
+    **          .string("v").real(item.value);
+    **         sink(b.buf_data(), b.buf_size());   // consume the bytes
+    **     }
+    **
+    ** build() instead moves the buffer out (handing ownership to the returned
+    ** Blob) and therefore ends reuse — prefer reset() in tight loops. */
+    Builder& reset() noexcept;
+    Builder& reserve(size_t bytes);
+    size_t   capacity() const noexcept;
+
     /* Finalize */
     Blob build();
 
-    /* Internal buffer access (used by mutation internals) */
+    /* Raw buffer view — the bytes encoded so far (zero-copy; valid until the
+    ** next mutating call, reset(), or build()). Also used by mutation internals. */
     const uint8_t* buf_data() const noexcept;
     size_t buf_size() const noexcept;
 
@@ -256,7 +280,6 @@ private:
     std::vector<uint8_t> buf_;
     void append(const uint8_t* data, size_t n);
     void append1(uint8_t b);
-    uint8_t* reserve(size_t n);
 };
 
 /* ── Iterator ─────────────────────────────────────────────────────────── */
