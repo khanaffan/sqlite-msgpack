@@ -1396,6 +1396,84 @@ static void test_value_as_float() {
     CHECK(std::fabs(v2.as_float() - 2.25f) < 1e-6f, "as_float from double");
 }
 
+/* ── Builder buffer reuse ─────────────────────────────────────────── */
+
+static void test_builder_buffer_reuse() {
+    using namespace msgpack;
+
+    /* reset() clears the contents but keeps the allocated capacity */
+    {
+        Builder b;
+        b.map_header(2).string("name").string("Alice").string("age").integer(30);
+        size_t produced = b.buf_size();
+        CHECK(produced > 0, "builder has bytes before reset");
+        size_t cap_before = b.capacity();
+        b.reset();
+        CHECK_EQ_INT(b.buf_size(), 0u, "reset rewinds size to 0");
+        CHECK(b.capacity() == cap_before, "reset keeps capacity");
+        CHECK(b.capacity() >= produced, "retained capacity covers prior blob");
+    }
+
+    /* reserve() raises capacity; reset() preserves it */
+    {
+        Builder b;
+        b.reserve(256);
+        CHECK(b.capacity() >= 256, "reserve raises capacity");
+        size_t cap = b.capacity();
+        b.map_header(1).string("k").integer(1);
+        b.reset();
+        CHECK(b.capacity() == cap, "capacity unchanged after encode+reset within reserve");
+    }
+
+    /* reset() returns *this so it chains into a fresh encode */
+    {
+        Builder b;
+        b.integer(999);                       /* stale content */
+        Blob blob = b.reset().boolean(true).build();
+        CHECK(blob.valid(), "chained reset()+encode valid");
+        CHECK(blob.type() == Type::True, "reset() discarded stale content");
+        CHECK_EQ_INT(blob.size(), 1u, "only the post-reset byte remains");
+    }
+
+    /* Tight loop: one Builder encodes many varying blobs while reusing the
+    ** SAME heap allocation — proven by a stable data pointer and capacity. */
+    {
+        Builder b;
+        b.reserve(64);
+        const uint8_t* base = b.buf_data();
+        size_t cap = b.capacity();
+        bool realloced = false;
+
+        for (int i = 0; i < 100; ++i) {
+            b.reset();
+            b.map_header(2)
+             .string("id").integer(i)
+             .string("sq").integer(static_cast<int64_t>(i) * i);
+
+            if (b.buf_data() != base || b.capacity() != cap) realloced = true;
+
+            /* Zero-copy view over the builder's live buffer */
+            Blob view(b.buf_data(), b.buf_size());
+            CHECK(view.valid(), "reused-buffer blob valid");
+            CHECK(view.extract("$.id").as_int64() == i, "reused-buffer id correct");
+            CHECK(view.extract("$.sq").as_int64() == static_cast<int64_t>(i) * i,
+                  "reused-buffer sq correct");
+        }
+        CHECK(!realloced, "buffer not reallocated across loop iterations");
+    }
+
+    /* build() still hands off ownership (ends reuse) and yields a valid Blob */
+    {
+        Builder b;
+        b.reserve(32);
+        b.reset();
+        b.array_header(3).integer(1).integer(2).integer(3);
+        Blob blob = b.build();
+        CHECK(blob.valid(), "build() after reuse setup is valid");
+        CHECK(blob.array_length() == 3, "build() produced expected array");
+    }
+}
+
 /* ── main ─────────────────────────────────────────────────────────── */
 
 int main() {
@@ -1429,6 +1507,7 @@ int main() {
     test_iterator_empty_containers();
     test_unsigned_integer_value_and_builder();
     test_value_as_float();
+    test_builder_buffer_reuse();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

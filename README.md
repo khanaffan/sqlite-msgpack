@@ -1366,7 +1366,7 @@ cd build && ctest --output-on-failure
 | `msgpack_unit` | C | 29 | Core SQLite extension unit tests |
 | `msgpack_sql` | SQL | — | SQL integration tests via CLI |
 | `msgpack_spec_p1`–`p10` | C | 10 suites | Per-section msgpack spec compliance |
-| `msgpack_blob_unit` | C++ | 320 | Standalone C++ API (no SQLite dependency) |
+| `msgpack_blob_unit` | C++ | 632 | Standalone C++ API (no SQLite dependency) |
 | `msgpack_interop` | C++ | 197 | C++ ↔ SQLite interoperability |
 | `fuzz_corpus` | C | 100+ | Fuzz corpus against SQL extension |
 | `fuzz_blob_corpus` | C++ | 100+ | Fuzz corpus against C++ API |

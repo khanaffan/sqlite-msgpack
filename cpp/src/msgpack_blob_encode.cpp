@@ -70,11 +70,6 @@ void Builder::append(const uint8_t* data, size_t n) {
     buf_.insert(buf_.end(), data, data + n);
 }
 void Builder::append1(uint8_t b) { buf_.push_back(b); }
-uint8_t* Builder::reserve(size_t n) {
-    size_t old = buf_.size();
-    buf_.resize(old + n);
-    return buf_.data() + old;
-}
 
 Builder& Builder::nil() { append1(MP_NIL); return *this; }
 
@@ -318,6 +313,13 @@ Builder& Builder::timestamp(int64_t sec, uint32_t nsec) {
 
 const uint8_t* Builder::buf_data() const noexcept { return buf_.data(); }
 size_t Builder::buf_size() const noexcept { return buf_.size(); }
+
+/* Buffer reuse: std::vector::clear() drops the elements but keeps the
+** allocated storage, so a Builder can be rewound and reused without a fresh
+** malloc. reserve() pre-grows that storage; capacity() reports it. */
+Builder& Builder::reset() noexcept { buf_.clear(); return *this; }
+Builder& Builder::reserve(size_t bytes) { buf_.reserve(bytes); return *this; }
+size_t Builder::capacity() const noexcept { return buf_.capacity(); }
 
 Builder& Builder::value(const Value& v) {
     switch (v.type()) {

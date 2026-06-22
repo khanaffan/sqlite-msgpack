@@ -317,13 +317,47 @@ Blob blob = b.build();
 
 | Method | Description |
 |---|---|
-| `buf_data() → const uint8_t*` | Pointer to bytes accumulated so far |
+| `buf_data() → const uint8_t*` | Zero-copy pointer to bytes accumulated so far |
 | `buf_size() → size_t` | Number of bytes accumulated so far |
+| `capacity() → size_t` | Bytes currently allocated (≥ `buf_size()`) |
+
+The `buf_data()`/`buf_size()` view stays valid until the next encode call,
+`reset()`, or `build()` — consume it before mutating the Builder again.
+
+### Buffer reuse (tight loops)
+
+`build()` *moves* the internal buffer into the returned `Blob`, so a Builder that
+is built and discarded each iteration allocates a fresh buffer every time. To
+encode many blobs in a hot loop **without re-allocating**, rewind one Builder
+with `reset()` and read the bytes through `buf_data()`/`buf_size()` instead:
+
+| Method | Description |
+|---|---|
+| `reset() → Builder&` | Rewind to empty, **keeping** the heap allocation (capacity) |
+| `reserve(size_t) → Builder&` | Pre-grow the buffer so even the first iterations don't malloc |
+| `capacity() → size_t` | Inspect the retained allocation size |
+
+`reset()` is built on `std::vector::clear()`, which keeps capacity, so after the
+buffer warms up to its peak size the loop performs **zero allocations**. Use
+`build()` only when you want to hand ownership of the bytes to a `Blob` (which
+ends reuse).
+
+```cpp
+Builder b;
+b.reserve(64);                       // optional: skip warm-up growth
+for (const auto& item : items) {
+    b.reset();                       // rewind, keep the allocation
+    b.map_header(2)
+      .string("id").integer(item.id)
+      .string("v").real(item.value);
+    sink(b.buf_data(), b.buf_size()); // consume the zero-copy view
+}
+```
 
 ### Finalize
 
 ```cpp
-Blob build();                   // consume builder, return Blob
+Blob build();                   // consume builder (move out), return Blob
 static Blob quote(const Value&); // one-shot: Value → Blob
 ```
 
@@ -447,6 +481,28 @@ std::string json = blob.to_json();
 // json == {"name":"Alice","scores":[95,87,91]}
 ```
 
+### Reuse one buffer across a tight loop
+
+When streaming many small blobs (e.g. to a socket, file, or DB), reuse a single
+Builder so the encode loop allocates only while the buffer is warming up:
+
+```cpp
+Builder b;
+b.reserve(128);                          // size once for the largest expected row
+
+for (const Reading& r : readings) {
+    b.reset();                           // rewind; capacity is retained
+    b.map_header(3)
+      .string("sensor").string(r.sensor)
+      .string("temp").real32(r.temp)
+      .string("ts").value(Value::timestamp(r.epoch));
+
+    // Emit the freshly encoded msgpack without copying or allocating.
+    write(fd, b.buf_data(), b.buf_size());
+}
+// After the first few iterations b.capacity() stops growing → zero mallocs.
+```
+
 ---
 
 ## Build integration
@@ -467,7 +523,7 @@ additionally builds the C++ ↔ SQLite `msgpack_interop` test).
 
 It produces:
 - `libmsgpack_blob_static.a` — static library
-- `msgpack_blob_unit` — unit test executable (320 tests, standalone C++ API)
+- `msgpack_blob_unit` — unit test executable (632 tests, standalone C++ API)
 - `blob_vectors_gen` — generator for the shared cross-language test vectors
   ([`../tests/vectors/blob_vectors.json`](../tests/vectors/blob_vectors.json))
 - `fuzz_blob_corpus_runner` — corpus-based fuzz runner (100+ corpus files)
