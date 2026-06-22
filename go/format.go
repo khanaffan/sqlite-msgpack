@@ -14,7 +14,7 @@ const MaxDepth = 200
 const MaxOutput = 64 * 1024 * 1024
 
 // Version of the library.
-const Version = "1.5.0"
+const Version = "1.6.0"
 
 // MessagePack format bytes.
 const (

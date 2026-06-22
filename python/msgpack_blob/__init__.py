@@ -26,7 +26,7 @@ from .builder import Builder
 from .iterator import EachRow, Iterator
 from .value import IntWidth, Type, Value, type_str
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 __all__ = [
     "Blob",
