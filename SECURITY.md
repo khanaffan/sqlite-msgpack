@@ -32,7 +32,7 @@ within **7 days** for confirmed vulnerabilities.
 The following are in scope for security reports:
 
 - **Buffer overflows / out-of-bounds reads** in the SQLite extension (`src/msgpack.c`)
-  or the C++ library (`src/msgpack_blob.cpp`) when processing untrusted msgpack blobs
+  or the C++ library (`cpp/src/msgpack_blob_*.cpp`) when processing untrusted msgpack blobs
 - **Memory leaks** triggered by crafted input
 - **Denial of service** via pathological input (excessive CPU or memory consumption)
 - **Integer overflows** leading to incorrect behaviour or memory corruption

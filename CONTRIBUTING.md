@@ -69,7 +69,7 @@ your fix.
 
 - **C code** (`src/msgpack.c`): follows the existing SQLite-adjacent style — 2-space
   indent, `camelCase` locals, `snake_case` functions.
-- **C++ code** (`src/msgpack_blob.cpp`, `include/msgpack_blob.hpp`): `snake_case`
+- **C++ code** (`cpp/src/msgpack_blob_*.cpp`, `cpp/include/msgpack_blob.hpp`): `snake_case`
   for methods and variables, `PascalCase` for types/enums, 4-space indent.
 - Compiler warnings are the primary lint mechanism. The C++ library compiles
   cleanly with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion`.
@@ -79,21 +79,25 @@ your fix.
 
 ```
 include/
-  msgpack_blob.hpp   C++ public header
   sqlite3.h          SQLite amalgamation header
 src/
   msgpack.c          SQLite extension implementation
-  msgpack_blob.cpp   Standalone C++ library
   sqlite3.c          SQLite amalgamation
+cpp/                 Standalone C++ Blob library (self-contained package)
+  include/msgpack_blob.hpp        C++ public header
+  src/msgpack_blob_detail.hpp     Shared private internals
+  src/msgpack_blob_{decode,encode,json,mutate,iterate}.cpp   Library modules
+  tests/test_msgpack_blob.cpp     C++ API unit tests
+  tests/fuzz_msgpack_blob.cpp     libFuzzer harness (C++ API)
+  tests/gen_blob_vectors.cpp      Cross-language test-vector generator
+  README.md                       C++ API reference
+python/  js/  rust/  go/          Native ports of the Blob API (see each README)
 tests/
   test_msgpack.c           C unit tests
-  test_msgpack_blob.cpp    C++ API unit tests
   test_interop.cpp         C++ ↔ SQLite integration tests
   fuzz_msgpack.c           libFuzzer harness (SQL extension)
-  fuzz_msgpack_blob.cpp    libFuzzer harness (C++ API)
-  fuzz_corpus/             Seed corpus files
-docs/
-  cpp-api.md         C++ API reference
+  fuzz_corpus/             Seed corpus files (shared)
+  vectors/blob_vectors.json  Shared cross-language test vectors
 ```
 
 ## Submitting changes
@@ -102,7 +106,7 @@ docs/
 2. Make your changes — keep commits focused and well-described.
 3. Ensure all tests pass: `cd build && ctest --output-on-failure`
 4. If you add new functionality, add corresponding tests.
-5. If you change the public API, update `docs/cpp-api.md` and/or `README.md`.
+5. If you change the public API, update `cpp/README.md` and/or `README.md`.
 6. Open a pull request with a clear description of what and why.
 
 ## Byte-identical encoding
