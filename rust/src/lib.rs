@@ -61,4 +61,4 @@ pub const MAX_DEPTH: i32 = format::MAX_DEPTH;
 pub const MAX_OUTPUT: usize = format::MAX_OUTPUT;
 
 /// Crate version.
-pub const VERSION: &str = "1.5.0";
+pub const VERSION: &str = "1.6.0";

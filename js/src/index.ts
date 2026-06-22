@@ -25,4 +25,4 @@ export { Builder } from "./builder.ts";
 export { Iterator, EachRow } from "./iterator.ts";
 export { MAX_DEPTH, MAX_OUTPUT } from "./format.ts";
 
-export const VERSION = "1.5.0";
+export const VERSION = "1.6.0";
