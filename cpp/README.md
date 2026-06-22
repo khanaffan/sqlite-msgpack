@@ -451,36 +451,49 @@ std::string json = blob.to_json();
 
 ## Build integration
 
-The library is built as part of the CMake project:
+This directory is a self-contained CMake package — the C++ sibling of the
+[`python/`](../python/), [`js/`](../js/), [`rust/`](../rust/) and [`go/`](../go/)
+ports. Build and test it standalone:
 
-```cmake
-cmake -B build -DMSGPACK_BUILD_TESTS=ON
+```bash
+cmake -B build cpp -DMSGPACK_BUILD_TESTS=ON
 cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-This produces:
-- `libmsgpack_blob_static.a` — static library
-- `msgpack_blob_unit` — unit test executable (289 tests, standalone C++ API)
-- `msgpack_interop` — integration test executable (197 tests, C++ ↔ SQLite interop)
-- `fuzz_blob_corpus_runner` — corpus-based fuzz runner (83+ corpus files)
+…or let the repository-root build pull it in automatically via
+`add_subdirectory(cpp)` (the default top-level `cmake -B build` does this and
+additionally builds the C++ ↔ SQLite `msgpack_interop` test).
 
-Link against `msgpack_blob_static` and add `include/` to your include path.
+It produces:
+- `libmsgpack_blob_static.a` — static library
+- `msgpack_blob_unit` — unit test executable (320 tests, standalone C++ API)
+- `blob_vectors_gen` — generator for the shared cross-language test vectors
+  ([`../tests/vectors/blob_vectors.json`](../tests/vectors/blob_vectors.json))
+- `fuzz_blob_corpus_runner` — corpus-based fuzz runner (100+ corpus files)
+- `msgpack_interop` — C++ ↔ SQLite interop test (197 tests; built by the root project only)
+
+Link against `msgpack_blob_static`; its `PUBLIC` include directory
+(`cpp/include`) propagates automatically, so `#include "msgpack_blob.hpp"` just
+works.
 
 ### Testing
 
 ```bash
-# Run all tests (unit + integration + fuzz corpus)
-cd build && ctest --output-on-failure
+# Standalone cpp/ package build:
+cmake -B build cpp -DMSGPACK_BUILD_TESTS=ON && cmake --build build
+ctest --test-dir build --output-on-failure
 
-# Run only C++ API unit tests
+# Run only the C++ API unit tests
 ./build/msgpack_blob_unit
 
-# Run C++ ↔ SQLite interop tests
-./build/msgpack_interop
-
-# Run C++ fuzz corpus
+# Run the C++ fuzz corpus (corpus ships at the repository root)
 ./build/fuzz_blob_corpus_runner tests/fuzz_corpus
 ```
+
+When built from the repository root instead, the blob binaries land under
+`build/cpp/` (e.g. `./build/cpp/msgpack_blob_unit`) and the interop test runs as
+`./build/msgpack_interop`.
 
 ### Fuzz testing
 
@@ -499,7 +512,7 @@ exercises every public entry point with arbitrary byte sequences:
 To run with libFuzzer (requires Clang with libFuzzer support):
 
 ```bash
-cmake -B build-fuzz -DMSGPACK_BUILD_FUZZ=ON \
+cmake -B build-fuzz cpp -DMSGPACK_BUILD_FUZZ=ON \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build build-fuzz --target fuzz_msgpack_blob
 ./build-fuzz/fuzz_msgpack_blob tests/fuzz_corpus -max_total_time=300

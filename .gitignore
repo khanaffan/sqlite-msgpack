@@ -5,3 +5,24 @@ build/
 *.so
 *.dSYM/
 .DS_Store
+
+# Node / TypeScript (js/)
+node_modules/
+js/dist/
+*.tsbuildinfo
+
+# Python (python/)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+python/dist/
+python/build/
+
+# Rust (rust/)
+rust/target/
+Cargo.lock
+
+# Go (go/)
+go/vendor/

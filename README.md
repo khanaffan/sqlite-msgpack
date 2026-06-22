@@ -14,12 +14,21 @@ who has used `json_extract`, `json_set`, or `json_each`.
 MessagePack values are stored as ordinary SQLite `BLOB` columns. All functions are
 deterministic and side-effect free (copy-on-write mutation).
 
-A standalone **[C++ Blob API](docs/cpp-api.md)** is also provided for use outside
+A standalone **[C++ Blob API](cpp/README.md)** is also provided for use outside
 SQLite — it supports all msgpack primitive types (including fixed-width integers,
-float32/64, ext, timestamp, and binary) and produces byte-identical blobs.  Full
+float32/64, ext, timestamp, and binary) and produces byte-identical blobs.  It
+lives in its own [`cpp/`](cpp/) package alongside the other language ports.  Full
 [interop tests](tests/test_interop.cpp) verify round-trip compatibility between
-the SQL and C++ APIs, and a [fuzz harness](tests/fuzz_msgpack_blob.cpp) exercises
+the SQL and C++ APIs, and a [fuzz harness](cpp/tests/fuzz_msgpack_blob.cpp) exercises
 every public entry point with arbitrary byte sequences.
+
+Native re-implementations of the Blob API are also available for
+**[Python](python/)**, **[TypeScript / JavaScript](js/)**, **[Rust](rust/)** and
+**[Go](go/)**.  They expose the same `Blob` / `Builder` / `Value` / `Iterator`
+API and produce byte-identical output, so blobs are fully interchangeable
+between SQL, C++, Python, JS, Rust and Go.  All ports are validated against a
+[shared set of test vectors](tests/vectors/blob_vectors.json) generated from the
+C++ reference implementation.
 
 ---
 
@@ -45,8 +54,9 @@ every public entry point with arbitrary byte sequences.
 8. [MessagePack spec compliance](#messagepack-spec-compliance)
 9. [Performance benchmarks](#performance-benchmarks)
 10. [Serialised-size comparison](#serialised-size-comparison)
-11. [C++ Blob API](docs/cpp-api.md)
-12. [Testing](#testing)
+11. [C++ Blob API](cpp/README.md)
+12. [Python & JS/TS libraries](#language-libraries)
+13. [Testing](#testing)
 
 ---
 
@@ -1286,6 +1296,59 @@ is more compact.
 
 ---
 
+## Language libraries
+
+Besides the SQLite extension, the Blob API ships as self-contained packages —
+the reference **[C++ library](cpp/README.md)** plus native, zero-dependency
+re-implementations in other languages. Each one exposes the same `Blob` /
+`Builder` / `Value` / `Iterator` API and produces **byte-identical** msgpack
+output, so blobs round-trip freely between SQL, C++, Python, JavaScript, Rust and
+Go.
+
+| Library | Location | Runtime | Tests |
+|---|---|---|---|
+| C++ (reference) | [`cpp/`](cpp/) | C++17, no deps | `cmake -B build cpp && ctest --test-dir build` |
+| Python | [`python/`](python/) | Python ≥ 3.7, stdlib only | `python -m unittest discover -s tests` |
+| TypeScript / JS | [`js/`](js/) | Node ≥ 18 (ESM), no deps | `npm test` |
+| Rust | [`rust/`](rust/) | Rust ≥ 1.70, no deps | `cargo test` |
+| Go | [`go/`](go/) | Go ≥ 1.21, stdlib only | `go test ./...` |
+
+```python
+# Python
+from msgpack_blob import Blob, Value
+blob = Blob.from_json('{"name":"Alice"}')
+blob.set("$.age", Value.integer(30)).to_json()   # '{"name":"Alice","age":30}'
+```
+
+```ts
+// TypeScript
+import { Blob, Value } from "msgpack-blob";
+const blob = Blob.fromJson('{"name":"Alice"}');
+blob.set("$.age", Value.integer(30)).toJson();    // '{"name":"Alice","age":30}'
+```
+
+```rust
+// Rust
+use msgpack_blob::{Blob, Value};
+let blob = Blob::from_json(r#"{"name":"Alice"}"#);
+blob.set("$.age", &Value::integer(30)).to_json();  // {"name":"Alice","age":30}
+```
+
+```go
+// Go
+import mb "github.com/khanaffan/sqlite-msgpack/go"
+blob := mb.FromJSON(`{"name":"Alice"}`)
+blob.Set("$.age", mb.Int(30)).ToJSON()             // {"name":"Alice","age":30}
+```
+
+All ports are verified against a [shared vector file](tests/vectors/blob_vectors.json)
+generated from the C++ reference implementation
+([`cpp/tests/gen_blob_vectors.cpp`](cpp/tests/gen_blob_vectors.cpp), CTest target
+`blob_vectors_gen`), guaranteeing cross-language byte-identity for encoding,
+JSON conversion, mutation, extraction and iteration.
+
+---
+
 ## Testing
 
 The project includes a comprehensive test suite covering both the SQL extension and the C++ API.
@@ -1311,7 +1374,7 @@ cd build && ctest --output-on-failure
 ### Fuzz testing
 
 Both the SQL extension and C++ API have dedicated libFuzzer harnesses
-(`tests/fuzz_msgpack.c` and `tests/fuzz_msgpack_blob.cpp`).  Without libFuzzer,
+(`tests/fuzz_msgpack.c` and `cpp/tests/fuzz_msgpack_blob.cpp`).  Without libFuzzer,
 the corpus runners (`fuzz_corpus_runner` and `fuzz_blob_corpus_runner`) exercise
 the same code paths using 100+ seed files (including adversarially deep
 nesting, truncated length prefixes, and reserved-byte inputs) as part of the
@@ -1323,5 +1386,5 @@ cmake -B build-fuzz -DMSGPACK_BUILD_FUZZ=ON \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build build-fuzz
 ./build-fuzz/fuzz_msgpack tests/fuzz_corpus -max_total_time=300
-./build-fuzz/fuzz_msgpack_blob tests/fuzz_corpus -max_total_time=300
+./build-fuzz/cpp/fuzz_msgpack_blob tests/fuzz_corpus -max_total_time=300
 ```

@@ -4,6 +4,7 @@ project(sqlite_msgpack VERSION 1.5.0 LANGUAGES C CXX)
 # ── Options ──────────────────────────────────────────────────────────────────
 option(BUILD_SHARED_LIBS "Build msgpack as a loadable extension (.so/.dylib/.dll)" ON)
 option(MSGPACK_BUILD_TESTS "Build and register CTest tests" ON)
+option(MSGPACK_BUILD_FUZZ "Build libFuzzer-based fuzz harness" OFF)
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
 # Suppress MSVC warnings about POSIX names and use of standard C library functions
@@ -80,12 +81,11 @@ target_include_directories(msgpack_static PRIVATE include)
 target_compile_definitions(msgpack_static PRIVATE SQLITE_CORE)
 
 # ── Standalone C++ MsgPack Blob library (no SQLite dependency) ─────────────────
-add_library(msgpack_blob_static STATIC src/msgpack_blob.cpp)
-target_include_directories(msgpack_blob_static PUBLIC include)
-set_target_properties(msgpack_blob_static PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-if(NOT MSVC)
-    target_compile_options(msgpack_blob_static PRIVATE -Wall -Wextra)
-endif()
+# Lives in its own self-contained package under cpp/ (the C++ sibling of the
+# python/, js/, rust/ and go/ ports). add_subdirectory makes the
+# `msgpack_blob_static` target and its blob unit/corpus/vector-gen tests
+# available to this top-level build; the interop test below reuses the target.
+add_subdirectory(cpp)
 
 # ── SQLite3 CLI shell ─────────────────────────────────────────────────────────
 add_executable(sqlite3_cli src/shell.c src/sqlite3.c)
@@ -145,15 +145,11 @@ if(MSGPACK_BUILD_TESTS)
     add_msgpack_test(msgpack_spec_p9 test_spec_p9_typed_primitives.c)
     add_msgpack_test(msgpack_spec_p10 test_spec_p10_timestamp.c)
 
-    # C++ Blob API unit tests (standalone, no SQLite dependency)
-    add_executable(msgpack_blob_unit tests/test_msgpack_blob.cpp)
-    target_include_directories(msgpack_blob_unit PRIVATE include)
-    target_link_libraries(msgpack_blob_unit PRIVATE msgpack_blob_static)
-    set_target_properties(msgpack_blob_unit PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    add_test(NAME msgpack_blob_unit COMMAND msgpack_blob_unit)
-    set_tests_properties(msgpack_blob_unit PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
+    # C++ Blob API unit tests, the cross-language vector generator and the C++
+    # corpus runner live in cpp/CMakeLists.txt (built via add_subdirectory).
 
-    # C++ ↔ SQLite interop integration tests
+    # C++ ↔ SQLite interop integration tests (bridge the SQLite extension and the
+    # standalone Blob library, so this one stays at the top level).
     add_executable(msgpack_interop tests/test_interop.cpp)
     target_include_directories(msgpack_interop PRIVATE include)
     target_compile_definitions(msgpack_interop PRIVATE SQLITE_CORE)
@@ -168,7 +164,7 @@ if(MSGPACK_BUILD_TESTS)
 endif()
 
 # ── Fuzz testing (requires Clang with libFuzzer support) ──────────────────────
-option(MSGPACK_BUILD_FUZZ "Build libFuzzer-based fuzz harness" OFF)
+# (MSGPACK_BUILD_FUZZ is declared in the options block near the top.)
 
 if(MSGPACK_BUILD_FUZZ)
     # Apply sanitizer flags to all targets so coverage instrumentation
@@ -181,13 +177,7 @@ if(MSGPACK_BUILD_FUZZ)
     target_compile_options(fuzz_msgpack PRIVATE -fsanitize=fuzzer,address -g)
     target_link_options(fuzz_msgpack PRIVATE -fsanitize=fuzzer,address)
 
-    # C++ API fuzz harness
-    add_executable(fuzz_msgpack_blob
-        tests/fuzz_msgpack_blob.cpp src/msgpack_blob.cpp)
-    target_include_directories(fuzz_msgpack_blob PRIVATE include)
-    set_target_properties(fuzz_msgpack_blob PROPERTIES CXX_STANDARD 17)
-    target_compile_options(fuzz_msgpack_blob PRIVATE -fsanitize=fuzzer,address -g)
-    target_link_options(fuzz_msgpack_blob PRIVATE -fsanitize=fuzzer,address)
+    # The C++ Blob API fuzz harness (fuzz_msgpack_blob) is defined in cpp/.
 endif()
 
 # ── Fuzz corpus runner (no libFuzzer needed — runs corpus files directly) ─────
@@ -205,17 +195,7 @@ if(MSGPACK_BUILD_TESTS)
         COMMAND fuzz_corpus_runner ${CMAKE_SOURCE_DIR}/tests/fuzz_corpus)
     set_tests_properties(fuzz_corpus PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
 
-    # C++ API corpus runner (no libFuzzer needed)
-    add_executable(fuzz_blob_corpus_runner
-        tests/fuzz_blob_corpus_runner.cpp tests/fuzz_msgpack_blob.cpp src/msgpack_blob.cpp)
-    target_include_directories(fuzz_blob_corpus_runner PRIVATE include)
-    set_target_properties(fuzz_blob_corpus_runner PROPERTIES CXX_STANDARD 17)
-    if(NOT MSVC)
-        target_compile_options(fuzz_blob_corpus_runner PRIVATE -w)
-    endif()
-    add_test(NAME fuzz_blob_corpus
-        COMMAND fuzz_blob_corpus_runner ${CMAKE_SOURCE_DIR}/tests/fuzz_corpus)
-    set_tests_properties(fuzz_blob_corpus PROPERTIES PASS_REGULAR_EXPRESSION "0 failed")
+    # The C++ API corpus runner (fuzz_blob_corpus_runner) is defined in cpp/.
 endif()
 
 # ── Install headers ───────────────────────────────────────────────────────────
