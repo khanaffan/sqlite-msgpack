@@ -1,0 +1,35 @@
+{
+  "name": "msgpack-blob",
+  "version": "1.5.0",
+  "description": "Pure-TypeScript MessagePack Blob API — byte-identical to the sqlite-msgpack C++ library",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"test/*.test.ts\"",
+    "test:dist": "npm run build && node --test \"test/*.test.ts\""
+  },
+  "keywords": ["messagepack", "msgpack", "blob", "sqlite", "serialization"],
+  "license": "MIT",
+  "homepage": "https://github.com/khanaffan/sqlite-msgpack",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/khanaffan/sqlite-msgpack.git",
+    "directory": "js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

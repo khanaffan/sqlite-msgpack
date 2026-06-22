@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msgpack-blob"
+version = "1.5.0"
+description = "Pure-Python MessagePack Blob API — byte-identical to the sqlite-msgpack C++ library"
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "MIT" }
+authors = [{ name = "sqlite-msgpack contributors" }]
+keywords = ["messagepack", "msgpack", "blob", "sqlite", "serialization"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/khanaffan/sqlite-msgpack"
+Source = "https://github.com/khanaffan/sqlite-msgpack"
+
+[tool.setuptools]
+packages = ["msgpack_blob"]
+
+[tool.setuptools.package-data]
+msgpack_blob = ["py.typed"]

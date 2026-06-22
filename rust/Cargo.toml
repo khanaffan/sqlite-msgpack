@@ -1,0 +1,17 @@
+[package]
+name = "msgpack_blob"
+version = "1.5.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Pure-Rust MessagePack Blob API — byte-identical to the sqlite-msgpack C++ library"
+license = "MIT"
+repository = "https://github.com/khanaffan/sqlite-msgpack"
+keywords = ["messagepack", "msgpack", "blob", "sqlite", "serialization"]
+categories = ["encoding", "no-std"]
+
+[lib]
+name = "msgpack_blob"
+path = "src/lib.rs"
+
+# Zero dependencies (std only). The test suite uses a tiny std-only JSON reader
+# to replay the shared cross-language vectors.
