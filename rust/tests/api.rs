@@ -184,7 +184,10 @@ fn truncated_map_key_does_not_panic() {
     // Mutation returns the original blob unchanged.
     assert_eq!(blob.set("$.x", &Value::integer(1)).data(), blob.data());
     assert_eq!(blob.remove("$.x").data(), blob.data());
-    assert_eq!(blob.patch(&Blob::from_json(r#"{"a":1}"#)).data(), blob.data());
+    assert_eq!(
+        blob.patch(&Blob::from_json(r#"{"a":1}"#)).data(),
+        blob.data()
+    );
     // Flat and recursive iteration yield no usable rows (no panic).
     assert_eq!(Iterator::new(&blob, "$", false).rows().len(), 0);
     let _ = Iterator::new(&blob, "$", true).rows();
