@@ -4,6 +4,9 @@
 
 [![CI](https://github.com/khanaffan/sqlite-msgpack/actions/workflows/ci.yml/badge.svg)](https://github.com/khanaffan/sqlite-msgpack/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-website-0b6bcb.svg)](https://khanaffan.github.io/sqlite-msgpack/)
+
+📖 **[Read the documentation site →](https://khanaffan.github.io/sqlite-msgpack/)**
 
 **sqlite-msgpack** is a SQLite extension that adds functions for creating, querying, and
 mutating [MessagePack](https://msgpack.org/) BLOBs directly inside SQL queries. The API is

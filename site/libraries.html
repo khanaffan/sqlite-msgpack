@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Language libraries · sqlite-msgpack</title>
+  <meta name="description" content="The MessagePack Blob API as self-contained, byte-identical libraries for C++, Python, TypeScript/JavaScript, Rust, and Go — plus the testing setup.">
+  <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/style.css">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Language libraries · sqlite-msgpack">
+  <meta property="og:description" content="The same Blob API in C++, Python, JS/TS, Rust, and Go.">
+</head>
+<body>
+  <!-- ===== NAVBAR ===== -->
+  <header class="navbar">
+    <div class="navbar__inner">
+      <a class="navbar__brand" href="index.html">
+        <img class="logo" src="assets/img/logo.svg" alt="">
+        <span>sqlite&#8209;<b>msgpack</b></span>
+      </a>
+      <nav class="navbar__links" aria-label="Primary">
+        <a href="guide.html">Guide</a>
+        <a href="functions.html">Functions</a>
+        <a href="schema.html">Schema</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="libraries.html" class="active">Libraries</a>
+        <span class="navbar__sep" aria-hidden="true"></span>
+        <a href="https://github.com/khanaffan/sqlite-msgpack">GitHub</a>
+        <button class="icon-btn theme-toggle" data-theme-toggle type="button" aria-label="Toggle color theme">
+          <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2 12h2M20 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>
+          <svg class="moon" viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+        </button>
+      </nav>
+      <button class="icon-btn nav-toggle" data-nav-toggle type="button" aria-label="Toggle menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="docs">
+    <aside class="docs__sidebar">
+      <nav aria-label="On this page">
+        <ul class="sidenav__list">
+          <li><a href="#overview">Overview</a></li>
+          <li><a href="#cpp">C++ (reference)</a></li>
+          <li><a href="#python">Python</a></li>
+          <li><a href="#js">TypeScript / JS</a></li>
+          <li><a href="#rust">Rust</a></li>
+          <li><a href="#go">Go</a></li>
+          <li><a href="#vectors">Cross-language vectors</a></li>
+          <li><a href="#testing">Testing</a></li>
+        </ul>
+      </nav>
+    </aside>
+    <article class="docs__content">
+      <div class="page-title">
+        <h1>Language libraries</h1>
+        <p>The same <code>Blob</code> / <code>Builder</code> / <code>Value</code> / <code>Iterator</code> API in C++, Python, JS/TS, Rust, and Go &mdash; with byte-identical output.</p>
+      </div>
+
+      <h2 id="overview">Overview</h2>
+      <p>Besides the SQLite extension, the Blob API ships as self-contained packages &mdash; the reference <strong><a href="https://github.com/khanaffan/sqlite-msgpack/blob/main/cpp/README.md">C++ library</a></strong> plus native, zero-dependency re-implementations in other languages. Each one exposes the same <code>Blob</code> / <code>Builder</code> / <code>Value</code> / <code>Iterator</code> API and produces <strong>byte-identical</strong> msgpack output, so blobs round-trip freely between SQL, C++, Python, JavaScript, Rust and Go.</p>
+      <div class="table-wrap"><table class="table"><thead><tr><th>Library</th><th>Location</th><th>Runtime</th><th>Tests</th></tr></thead><tbody><tr><td>C++ (reference)</td><td><a href="https://github.com/khanaffan/sqlite-msgpack/tree/main/cpp"><code>cpp/</code></a></td><td>C++17, no deps</td><td><code>cmake -B build cpp &amp;&amp; ctest --test-dir build</code></td></tr><tr><td>Python</td><td><a href="https://github.com/khanaffan/sqlite-msgpack/tree/main/python"><code>python/</code></a></td><td>Python ≥ 3.7, stdlib only</td><td><code>python -m unittest discover -s tests</code></td></tr><tr><td>TypeScript / JS</td><td><a href="https://github.com/khanaffan/sqlite-msgpack/tree/main/js"><code>js/</code></a></td><td>Node ≥ 18 (ESM), no deps</td><td><code>npm test</code></td></tr><tr><td>Rust</td><td><a href="https://github.com/khanaffan/sqlite-msgpack/tree/main/rust"><code>rust/</code></a></td><td>Rust ≥ 1.70, no deps</td><td><code>cargo test</code></td></tr><tr><td>Go</td><td><a href="https://github.com/khanaffan/sqlite-msgpack/tree/main/go"><code>go/</code></a></td><td>Go ≥ 1.21, stdlib only</td><td><code>go test ./...</code></td></tr></tbody></table></div>
+
+      <h2 id="cpp">C++ (reference)</h2>
+      <p>The reference C++17 implementation has no dependencies, lives in <code>cpp/</code>, and is documented in the <a href="https://github.com/khanaffan/sqlite-msgpack/blob/main/cpp/README.md">C++ README</a>.</p>
+      <div class="code-block"><pre><code class="language-bash">cmake -B build cpp &amp;&amp; ctest --test-dir build</code></pre></div>
+
+      <h2 id="python">Python</h2>
+      <p>The Python port targets Python ≥ 3.7 and uses the standard library only.</p>
+      <div class="code-block"><pre><code class="language-python"># Python
+from msgpack_blob import Blob, Value
+blob = Blob.from_json('{"name":"Alice"}')
+blob.set("$.age", Value.integer(30)).to_json()   # '{"name":"Alice","age":30}'</code></pre></div>
+      <div class="code-block"><pre><code class="language-bash">python -m unittest discover -s tests</code></pre></div>
+
+      <h2 id="js">TypeScript / JS</h2>
+      <p>The TypeScript / JavaScript port is ESM, has no dependencies, and runs on Node ≥ 18.</p>
+      <div class="code-block"><pre><code class="language-ts">// TypeScript
+import { Blob, Value } from "msgpack-blob";
+const blob = Blob.fromJson('{"name":"Alice"}');
+blob.set("$.age", Value.integer(30)).toJson();    // '{"name":"Alice","age":30}'</code></pre></div>
+      <div class="code-block"><pre><code class="language-bash">npm test</code></pre></div>
+
+      <h2 id="rust">Rust</h2>
+      <p>The Rust crate targets Rust ≥ 1.70 and has no dependencies.</p>
+      <div class="code-block"><pre><code class="language-rust">// Rust
+use msgpack_blob::{Blob, Value};
+let blob = Blob::from_json(r#"{"name":"Alice"}"#);
+blob.set("$.age", &amp;Value::integer(30)).to_json();  // {"name":"Alice","age":30}</code></pre></div>
+      <div class="code-block"><pre><code class="language-bash">cargo test</code></pre></div>
+
+      <h2 id="go">Go</h2>
+      <p>The Go package targets Go ≥ 1.21 and uses the standard library only.</p>
+      <div class="code-block"><pre><code class="language-go">// Go
+import mb "github.com/khanaffan/sqlite-msgpack/go"
+blob := mb.FromJSON(`{"name":"Alice"}`)
+blob.Set("$.age", mb.Int(30)).ToJSON()             // {"name":"Alice","age":30}</code></pre></div>
+      <div class="code-block"><pre><code class="language-bash">go test ./...</code></pre></div>
+
+      <h2 id="vectors">Cross-language vectors</h2>
+      <p>All ports are verified against a <a href="https://github.com/khanaffan/sqlite-msgpack/blob/main/tests/vectors/blob_vectors.json">shared vector file</a> generated from the C++ reference implementation (<a href="https://github.com/khanaffan/sqlite-msgpack/blob/main/cpp/tests/gen_blob_vectors.cpp"><code>cpp/tests/gen_blob_vectors.cpp</code></a>, CTest target <code>blob_vectors_gen</code>), guaranteeing cross-language byte-identity for encoding, JSON conversion, mutation, extraction and iteration.</p>
+
+      <h2 id="testing">Testing</h2>
+      <p>The project includes a comprehensive test suite covering both the SQL extension and the C++ API.</p>
+      <div class="code-block"><pre><code class="language-bash">cmake -B build -DMSGPACK_BUILD_TESTS=ON
+cmake --build build
+cd build &amp;&amp; ctest --output-on-failure</code></pre></div>
+      <h3 id="test-targets">Test targets</h3>
+      <div class="table-wrap"><table class="table"><thead><tr><th>CTest target</th><th>Language</th><th>Tests</th><th>Description</th></tr></thead><tbody><tr><td><code>msgpack_unit</code></td><td>C</td><td>29</td><td>Core SQLite extension unit tests</td></tr><tr><td><code>msgpack_sql</code></td><td>SQL</td><td>—</td><td>SQL integration tests via CLI</td></tr><tr><td><code>msgpack_spec_p1</code>–<code>p10</code></td><td>C</td><td>10 suites</td><td>Per-section msgpack spec compliance</td></tr><tr><td><code>msgpack_blob_unit</code></td><td>C++</td><td>632</td><td>Standalone C++ API (no SQLite dependency)</td></tr><tr><td><code>msgpack_interop</code></td><td>C++</td><td>197</td><td>C++ ↔ SQLite interoperability</td></tr><tr><td><code>fuzz_corpus</code></td><td>C</td><td>100+</td><td>Fuzz corpus against SQL extension</td></tr><tr><td><code>fuzz_blob_corpus</code></td><td>C++</td><td>100+</td><td>Fuzz corpus against C++ API</td></tr></tbody></table></div>
+      <h3 id="fuzz">Fuzz testing</h3>
+      <p>Both the SQL extension and C++ API have dedicated libFuzzer harnesses (<code>tests/fuzz_msgpack.c</code> and <code>cpp/tests/fuzz_msgpack_blob.cpp</code>). Without libFuzzer, the corpus runners (<code>fuzz_corpus_runner</code> and <code>fuzz_blob_corpus_runner</code>) exercise the same code paths using 100+ seed files (including adversarially deep nesting, truncated length prefixes, and reserved-byte inputs) as part of the normal CTest suite.</p>
+      <div class="code-block"><pre><code class="language-bash"># With libFuzzer (Clang required)
+cmake -B build-fuzz -DMSGPACK_BUILD_FUZZ=ON \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-fuzz
+./build-fuzz/fuzz_msgpack tests/fuzz_corpus -max_total_time=300
+./build-fuzz/cpp/fuzz_msgpack_blob tests/fuzz_corpus -max_total_time=300</code></pre></div>
+    </article>
+  </main>
+
+  <div class="backdrop"></div>
+  <button class="icon-btn docs-fab" data-sidebar-toggle type="button" aria-label="Toggle contents">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="footer">
+    <div class="footer__inner">
+      <div class="footer__brand">
+        <a class="navbar__brand" href="index.html">
+          <img class="logo" src="assets/img/logo.svg" alt="">
+          <span>sqlite&#8209;<b>msgpack</b></span>
+        </a>
+        <p>A SQLite extension and multi-language library for MessagePack BLOBs. Released under the MIT License.</p>
+      </div>
+      <div class="footer__cols">
+        <div class="footer__col">
+          <h4>Docs</h4>
+          <ul>
+            <li><a href="guide.html">Guide</a></li>
+            <li><a href="functions.html">Function reference</a></li>
+            <li><a href="schema.html">Schema validation</a></li>
+            <li><a href="benchmarks.html">Benchmarks</a></li>
+            <li><a href="libraries.html">Language libraries</a></li>
+          </ul>
+        </div>
+        <div class="footer__col">
+          <h4>Project</h4>
+          <ul>
+            <li><a href="https://github.com/khanaffan/sqlite-msgpack">GitHub</a></li>
+            <li><a href="https://github.com/khanaffan/sqlite-msgpack/blob/main/LICENSE">License (MIT)</a></li>
+            <li><a href="https://github.com/khanaffan/sqlite-msgpack/blob/main/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/khanaffan/sqlite-msgpack/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          </ul>
+        </div>
+        <div class="footer__col">
+          <h4>Related</h4>
+          <ul>
+            <li><a href="https://msgpack.org/">MessagePack</a></li>
+            <li><a href="https://www.sqlite.org/json1.html">SQLite JSON1</a></li>
+            <li><a href="https://www.sqlite.org/">SQLite</a></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="footer__bottom">
+      <span>&copy; 2024 sqlite-msgpack contributors.</span>
+      <span>Not affiliated with the MessagePack or SQLite projects.</span>
+    </div>
+  </footer>
+
+  <script src="assets/js/main.js"></script>
+</body>
+</html>
