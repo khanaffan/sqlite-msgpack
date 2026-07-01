@@ -1146,6 +1146,187 @@ static int mpApplyEdit(
   return mpEditStep(out, a,n, 0, zPath, 1, newBin, nNew, mode, 0);
 }
 
+/*
+** ============================================================
+** Fast path for msgpack_set() with multiple top-level-key edits.
+**
+** The generic driver below applies each (path,value) pair with a full blob
+** rebuild, which is O(nPairs * mapSize) per call. When every path is a simple
+** top-level key ("$.<key>") — the dominant case for record/property storage —
+** all edits are applied in a SINGLE rebuild pass, O(mapSize + nPairs). This
+** keeps msgpack_set() competitive with jsonb_set()/json_set() on wide records.
+** ============================================================
+*/
+
+/* One pending "$.<key> = value" edit for the batch fast path. */
+typedef struct MpKeyEdit {
+  const char *zKey;   /* top-level key bytes (points into the path text) */
+  u32         nKey;
+  const u8   *val;    /* encoded msgpack value (points into value scratch) */
+  u32         nVal;
+  u32         valOff; /* value offset in scratch buffer (resolved to val later) */
+  int         used;   /* set once matched against an existing map key */
+} MpKeyEdit;
+
+/* FNV-1a hash over key bytes. */
+static u32 mpKeyHash(const char *z, u32 n){
+  u32 h = 2166136261u, i;
+  for( i=0; i<n; i++ ){ h ^= (u8)z[i]; h *= 16777619u; }
+  return h;
+}
+
+/* Find edit index for key z/nz in the open-addressing table, or -1. */
+static int mpHashFind(const int *aH, u32 mask, const MpKeyEdit *edits,
+                      const char *z, u32 nz){
+  u32 pos = mpKeyHash(z,nz) & mask;
+  for(;;){
+    int e = aH[pos];
+    if( e<0 ) return -1;
+    if( edits[e].nKey==nz && memcmp(edits[e].zKey,z,nz)==0 ) return e;
+    pos = (pos+1) & mask;
+  }
+}
+static void mpHashInsert(int *aH, u32 mask, const MpKeyEdit *edits, int idx){
+  u32 pos = mpKeyHash(edits[idx].zKey, edits[idx].nKey) & mask;
+  while( aH[pos]>=0 ) pos = (pos+1) & mask;
+  aH[pos] = idx;
+}
+
+/*
+** True if zPath is exactly "$.<key>" (single top-level string key, no deeper
+** steps). On success returns 1 and sets pKey/pnKey to the key bytes.
+*/
+static int mpPathIsSimpleKey(const char *zPath, const char **pKey, u32 *pnKey){
+  int pi = 1, step;
+  const char *zKey = 0; int nKey = 0; i64 idx = 0;
+  if( !zPath || zPath[0]!='$' ) return 0;
+  step = mpPathStep(zPath, &pi, &zKey, &nKey, &idx);
+  if( step!='k' || nKey<=0 ) return 0;
+  if( mpPathStep(zPath, &pi, &zKey, &nKey, &idx) != 0 ) return 0; /* must be end */
+  *pKey = zKey; *pnKey = (u32)nKey;
+  return 1;
+}
+
+static int mpIsTopLevelMap(const u8 *a, u32 n){
+  u8 b;
+  if( n<1 ) return 0;
+  b = a[0];
+  return (b>=0x80 && b<=0x8f) || b==MP_MAP16 || b==MP_MAP32;
+}
+
+/*
+** Apply all `edits` (unique top-level keys) to the map in (a,n) in one pass,
+** writing the rebuilt map into out. Existing keys are replaced in place;
+** absent keys are appended in first-appearance order. Returns SQLITE_OK, or a
+** non-OK code to signal the caller to fall back to the generic per-edit path.
+*/
+static int mpEditMapBatch(
+  MpBuf *out, const u8 *a, u32 n,
+  MpKeyEdit *edits, int nEdit,
+  const int *aH, u32 mask
+){
+  u8 b = a[0];
+  u32 count, dataOff, j, cur2, newCount, appended = 0;
+  int i;
+  MpBuf tmp;
+
+  if( b>=0x80 && b<=0x8f ){ count=b&0x0f; dataOff=1; }
+  else if( b==MP_MAP16 ){ if(3>n) return SQLITE_ERROR; count=mpRead16(a+1); dataOff=3; }
+  else if( b==MP_MAP32 ){ if(5>n) return SQLITE_ERROR; count=mpRead32(a+1); dataOff=5; }
+  else return SQLITE_ERROR;
+
+  mpBufInit(&tmp, out->pCtx);
+  cur2 = dataOff;
+  for( j=0; j<count; j++ ){
+    u8 kb; const char *kStr=0; u32 kLen=0;
+    u32 valOff, pairEnd; int ei;
+    if( cur2>=n ){ mpBufReset(&tmp); return SQLITE_ERROR; }
+    kb = a[cur2];
+    if( kb>=0xa0 && kb<=0xbf )         { kLen=kb&0x1f;            kStr=(const char*)(a+cur2+1); }
+    else if( kb==MP_STR8 && cur2+2<=n ){ kLen=a[cur2+1];          kStr=(const char*)(a+cur2+2); }
+    else if( kb==MP_STR16&& cur2+3<=n ){ kLen=mpRead16(a+cur2+1); kStr=(const char*)(a+cur2+3); }
+    else if( kb==MP_STR32&& cur2+5<=n ){ kLen=mpRead32(a+cur2+1); kStr=(const char*)(a+cur2+5); }
+    valOff  = mpSkipOne(a,n,cur2);   if(!valOff){ mpBufReset(&tmp); return SQLITE_ERROR; }
+    pairEnd = mpSkipOne(a,n,valOff); if(!pairEnd){ mpBufReset(&tmp); return SQLITE_ERROR; }
+
+    ei = kStr ? mpHashFind(aH, mask, edits, kStr, kLen) : -1;
+    if( ei>=0 ){
+      mpBufAppend(&tmp, a+cur2, valOff-cur2);           /* original key bytes */
+      mpBufAppend(&tmp, edits[ei].val, edits[ei].nVal); /* new value */
+      edits[ei].used = 1;
+    } else {
+      mpBufAppend(&tmp, a+cur2, pairEnd-cur2);          /* copy pair verbatim */
+    }
+    cur2 = pairEnd;
+  }
+
+  /* Append edits whose key was absent, in first-appearance order. */
+  for( i=0; i<nEdit; i++ ){
+    u32 kn = edits[i].nKey;
+    if( edits[i].used ) continue;
+    if( kn<=31 )        { mpBufAppend1(&tmp,(u8)(MP_FIXSTR_MASK|kn)); }
+    else if( kn<=0xff ) { u8 h[2]={MP_STR8,(u8)kn}; mpBufAppend(&tmp,h,2); }
+    else                { u8 h[3]; h[0]=MP_STR16; mpWrite16(h+1,(u16)kn); mpBufAppend(&tmp,h,3); }
+    mpBufAppend(&tmp, (const u8*)edits[i].zKey, kn);
+    mpBufAppend(&tmp, edits[i].val, edits[i].nVal);
+    appended++;
+  }
+
+  if( tmp.bErr ){ mpBufReset(&tmp); return SQLITE_NOMEM; }
+  newCount = count + appended;
+  mpEncodeMapHeader(out, newCount);
+  mpBufAppend(out, tmp.aBuf, tmp.nUsed);
+  mpBufReset(&tmp);
+  return out->bErr ? SQLITE_NOMEM : SQLITE_OK;
+}
+
+/*
+** Drop every top-level key present in the `keys` set from the map in (a,n) in a
+** single pass (all occurrences of a listed key are removed). Returns SQLITE_OK,
+** or a non-OK code to signal the caller to fall back to the generic path.
+** Only the zKey/nKey fields of `keys` are used.
+*/
+static int mpRemoveMapBatch(
+  MpBuf *out, const u8 *a, u32 n,
+  const MpKeyEdit *keys, const int *aH, u32 mask
+){
+  u8 b = a[0];
+  u32 count, dataOff, j, cur2, newCount;
+  MpBuf tmp;
+
+  if( b>=0x80 && b<=0x8f ){ count=b&0x0f; dataOff=1; }
+  else if( b==MP_MAP16 ){ if(3>n) return SQLITE_ERROR; count=mpRead16(a+1); dataOff=3; }
+  else if( b==MP_MAP32 ){ if(5>n) return SQLITE_ERROR; count=mpRead32(a+1); dataOff=5; }
+  else return SQLITE_ERROR;
+
+  newCount = count;
+  mpBufInit(&tmp, out->pCtx);
+  cur2 = dataOff;
+  for( j=0; j<count; j++ ){
+    u8 kb; const char *kStr=0; u32 kLen=0;
+    u32 valOff, pairEnd; int ei;
+    if( cur2>=n ){ mpBufReset(&tmp); return SQLITE_ERROR; }
+    kb = a[cur2];
+    if( kb>=0xa0 && kb<=0xbf )         { kLen=kb&0x1f;            kStr=(const char*)(a+cur2+1); }
+    else if( kb==MP_STR8 && cur2+2<=n ){ kLen=a[cur2+1];          kStr=(const char*)(a+cur2+2); }
+    else if( kb==MP_STR16&& cur2+3<=n ){ kLen=mpRead16(a+cur2+1); kStr=(const char*)(a+cur2+3); }
+    else if( kb==MP_STR32&& cur2+5<=n ){ kLen=mpRead32(a+cur2+1); kStr=(const char*)(a+cur2+5); }
+    valOff  = mpSkipOne(a,n,cur2);   if(!valOff){ mpBufReset(&tmp); return SQLITE_ERROR; }
+    pairEnd = mpSkipOne(a,n,valOff); if(!pairEnd){ mpBufReset(&tmp); return SQLITE_ERROR; }
+
+    ei = kStr ? mpHashFind(aH, mask, keys, kStr, kLen) : -1;
+    if( ei>=0 ) newCount--;                            /* drop this pair */
+    else        mpBufAppend(&tmp, a+cur2, pairEnd-cur2); /* keep verbatim */
+    cur2 = pairEnd;
+  }
+
+  if( tmp.bErr ){ mpBufReset(&tmp); return SQLITE_NOMEM; }
+  mpEncodeMapHeader(out, newCount);
+  mpBufAppend(out, tmp.aBuf, tmp.nUsed);
+  mpBufReset(&tmp);
+  return out->bErr ? SQLITE_NOMEM : SQLITE_OK;
+}
+
 /* ---- Common driver for set/insert/replace/array_insert ---- */
 static void msgpackEditFunc(
   sqlite3_context *ctx, int argc, sqlite3_value **argv, int mode
@@ -1162,6 +1343,81 @@ static void msgpackEditFunc(
   }
   a=(const u8*)sqlite3_value_blob(argv[0]);
   n=(u32)sqlite3_value_bytes(argv[0]);
+
+  /* ---------- Fast path: msgpack_set() with only simple top-level keys ----------
+  ** Applies every "$.<key> = value" pair in a single rebuild instead of one
+  ** full-blob rebuild per pair: O(mapSize + nPairs) vs O(nPairs * mapSize).
+  ** Any structural surprise falls through to the generic path below.          */
+  if( mode==MP_EDIT_SET && mpIsTopLevelMap(a,n) ){
+    int nPairs = (argc-1)/2;
+    int allSimple = 1, k;
+    for( k=1; k<argc-1; k+=2 ){
+      const char *zk; u32 nk;
+      if( !mpPathIsSimpleKey((const char*)sqlite3_value_text(argv[k]), &zk, &nk) ){
+        allSimple = 0; break;
+      }
+    }
+    if( allSimple ){
+      MpKeyEdit editsStack[32];   /* avoid heap alloc for the common small case */
+      int hashStack[64];
+      MpKeyEdit *edits;
+      int *aH, nEdit = 0, ok = 1, heapEdits = 0, heapHash = 0;
+      u32 hsize = 16;
+      while( hsize < (u32)nPairs*2 ) hsize <<= 1;
+      if( nPairs <= 32 ) edits = editsStack;
+      else { edits = (MpKeyEdit*)sqlite3_malloc((int)(sizeof(MpKeyEdit)*nPairs)); heapEdits = 1; }
+      if( hsize <= 64 ) aH = hashStack;
+      else { aH = (int*)sqlite3_malloc((int)(sizeof(int)*hsize)); heapHash = 1; }
+      if( edits && aH ){
+        MpBuf valStore;
+        u32 hi;
+        for( hi=0; hi<hsize; hi++ ) aH[hi] = -1;
+        mpBufInit(&valStore, ctx);
+        for( k=1; k<argc-1; k+=2 ){
+          const char *zKey; u32 nKey, vstart, vlen; int ei;
+          mpPathIsSimpleKey((const char*)sqlite3_value_text(argv[k]), &zKey, &nKey);
+          vstart = valStore.nUsed;
+          mpEncodeSqlValue(&valStore, argv[k+1]);
+          if( valStore.bErr ){ ok = 0; break; }
+          vlen = valStore.nUsed - vstart;
+          ei = mpHashFind(aH, hsize-1, edits, zKey, nKey);
+          if( ei>=0 ){
+            edits[ei].valOff = vstart; edits[ei].nVal = vlen; /* last write wins */
+          } else {
+            edits[nEdit].zKey = zKey; edits[nEdit].nKey = nKey;
+            edits[nEdit].valOff = vstart; edits[nEdit].nVal = vlen; edits[nEdit].used = 0;
+            mpHashInsert(aH, hsize-1, edits, nEdit);
+            nEdit++;
+          }
+        }
+        if( ok ){
+          MpBuf outBuf;
+          int rc, e2;
+          for( e2=0; e2<nEdit; e2++ ) edits[e2].val = valStore.aBuf + edits[e2].valOff;
+          mpBufInit(&outBuf, ctx);
+          rc = mpEditMapBatch(&outBuf, a, n, edits, nEdit, aH, hsize-1);
+          if( rc==SQLITE_OK && !outBuf.bErr ){
+            u32 nOut; u8 *outData = mpBufFinish(&outBuf, &nOut);
+            if( heapEdits ) sqlite3_free(edits);
+            if( heapHash ) sqlite3_free(aH);
+            mpBufReset(&valStore);
+            if( !outData ) return;   /* OOM: error already set */
+            sqlite3_result_blob(ctx, outData, (int)nOut, sqlite3_free);
+            return;
+          }
+          mpBufReset(&outBuf);       /* fall through to generic path */
+        }
+        mpBufReset(&valStore);
+        if( !ok ){
+          if( heapEdits ) sqlite3_free(edits);
+          if( heapHash ) sqlite3_free(aH);
+          return;                    /* value-encode error already reported */
+        }
+      }
+      if( heapEdits ) sqlite3_free(edits);
+      if( heapHash ) sqlite3_free(aH);
+    }
+  }
 
   /* Chain edits; cur starts as a copy of the input blob */
   u8 *cur=(u8*)sqlite3_malloc(n>0?n:1);
@@ -1207,6 +1463,59 @@ static void msgpackRemoveFunc(
   }
   a=(const u8*)sqlite3_value_blob(argv[0]);
   n=(u32)sqlite3_value_bytes(argv[0]);
+
+  /* ---------- Fast path: remove only simple top-level keys in one pass ----------
+  ** Drops all requested "$.<key>" keys in a single rebuild instead of one
+  ** full-blob rebuild per path: O(mapSize + nPaths) vs O(nPaths * mapSize).    */
+  if( mpIsTopLevelMap(a,n) ){
+    int nPaths = argc-1, allSimple = 1, k;
+    for( k=1; k<argc; k++ ){
+      const char *zk; u32 nk;
+      if( !mpPathIsSimpleKey((const char*)sqlite3_value_text(argv[k]), &zk, &nk) ){
+        allSimple = 0; break;
+      }
+    }
+    if( allSimple ){
+      MpKeyEdit keysStack[32];
+      int hashStack[64];
+      MpKeyEdit *keys;
+      int *aH, nKeys = 0, heapKeys = 0, heapHash = 0;
+      u32 hsize = 16;
+      while( hsize < (u32)nPaths*2 ) hsize <<= 1;
+      if( nPaths <= 32 ) keys = keysStack;
+      else { keys = (MpKeyEdit*)sqlite3_malloc((int)(sizeof(MpKeyEdit)*nPaths)); heapKeys = 1; }
+      if( hsize <= 64 ) aH = hashStack;
+      else { aH = (int*)sqlite3_malloc((int)(sizeof(int)*hsize)); heapHash = 1; }
+      if( keys && aH ){
+        MpBuf outBuf;
+        u32 hi;
+        int rc;
+        for( hi=0; hi<hsize; hi++ ) aH[hi] = -1;
+        for( k=1; k<argc; k++ ){
+          const char *zKey; u32 nKey;
+          mpPathIsSimpleKey((const char*)sqlite3_value_text(argv[k]), &zKey, &nKey);
+          if( mpHashFind(aH, hsize-1, keys, zKey, nKey) < 0 ){
+            keys[nKeys].zKey = zKey; keys[nKeys].nKey = nKey;
+            mpHashInsert(aH, hsize-1, keys, nKeys);
+            nKeys++;
+          }
+        }
+        mpBufInit(&outBuf, ctx);
+        rc = mpRemoveMapBatch(&outBuf, a, n, keys, aH, hsize-1);
+        if( rc==SQLITE_OK && !outBuf.bErr ){
+          u32 nOut; u8 *outData = mpBufFinish(&outBuf, &nOut);
+          if( heapKeys ) sqlite3_free(keys);
+          if( heapHash ) sqlite3_free(aH);
+          if( !outData ) return;   /* OOM: error already set */
+          sqlite3_result_blob(ctx, outData, (int)nOut, sqlite3_free);
+          return;
+        }
+        mpBufReset(&outBuf);       /* fall through to generic path */
+      }
+      if( heapKeys ) sqlite3_free(keys);
+      if( heapHash ) sqlite3_free(aH);
+    }
+  }
 
   u8 *cur=(u8*)sqlite3_malloc(n>0?n:1);
   if(!cur){ sqlite3_result_error_nomem(ctx); return; }
@@ -1314,13 +1623,42 @@ static int mpMergePatch(
   MpBuf tmp; mpBufInit(&tmp,out->pCtx);
   u32 newCount=0;
 
+  /* Hash of patch keys (first occurrence wins) so each target key is matched in
+  ** O(1), making the merge O(target + patch) instead of O(target * patch). */
+  int  phStackArr[64];
+  int *phash = phStackArr;
+  u32  phmask, phSize = 16;
+  int  phHeap = 0;
+  while( phSize < pCount*2 ) phSize <<= 1;
+  if( phSize > 64 ){
+    phash = (int*)sqlite3_malloc((int)(sizeof(int)*phSize));
+    if( !phash ){ mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_NOMEM; }
+    phHeap = 1;
+  }
+  phmask = phSize - 1;
+  { u32 hi, kk;
+    for( hi=0; hi<phSize; hi++ ) phash[hi] = -1;
+    for( kk=0; kk<pCount; kk++ ){
+      u32 pos;
+      if( !pIdx[kk].zKey ) continue;                 /* non-string key: skip */
+      pos = mpKeyHash(pIdx[kk].zKey, pIdx[kk].nKey) & phmask;
+      for(;;){
+        int e = phash[pos];
+        if( e<0 ){ phash[pos]=(int)kk; break; }
+        if( pIdx[e].nKey==pIdx[kk].nKey &&
+            memcmp(pIdx[e].zKey,pIdx[kk].zKey,pIdx[kk].nKey)==0 ) break; /* keep first */
+        pos = (pos+1) & phmask;
+      }
+    }
+  }
+
   /* Phase 1: iterate target pairs. For each:
   **   - If the key is nil-valued in patch → drop it
   **   - If the key is in patch with non-nil value → merge recursively
   **   - Otherwise → copy verbatim */
   u32 ac=aDataOff;
   for(u32 j=0; j<aCount; j++){
-    if(ac>=n){ mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR; }
+    if(ac>=n){ mpBufReset(&tmp); if(phHeap) sqlite3_free(phash); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR; }
     u8 kb=a[ac];
     const char *kStr=0; u32 kLen=0;
     if(kb>=0xa0&&kb<=0xbf)        {kLen=kb&0x1f;           kStr=(const char*)(a+ac+1);}
@@ -1329,20 +1667,26 @@ static int mpMergePatch(
     else if(kb==MP_STR32&&ac+5<=n){kLen=mpRead32(a+ac+1);  kStr=(const char*)(a+ac+5);}
 
     u32 aValOff=mpSkipOne(a,n,ac);
-    if(!aValOff){mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR;}
+    if(!aValOff){mpBufReset(&tmp); if(phHeap) sqlite3_free(phash); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR;}
     u32 aPairEnd=mpSkipOne(a,n,aValOff);
-    if(!aPairEnd){mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR;}
+    if(!aPairEnd){mpBufReset(&tmp); if(phHeap) sqlite3_free(phash); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_ERROR;}
 
-    /* Find this key in pre-scanned patch index */
+    /* Find this key in the patch via the pre-built hash */
     int foundInPatch=0, patchIsNil=0;
     u32 pMatchVal=0;
-    for(u32 k=0; k<pCount; k++){
-      if(pIdx[k].zKey && kStr && (int)pIdx[k].nKey==(int)kLen &&
-         memcmp(pIdx[k].zKey,kStr,kLen)==0){
-        foundInPatch=1; pMatchVal=pIdx[k].valOff;
-        patchIsNil=(pIdx[k].valOff<np && p[pIdx[k].valOff]==MP_NIL);
-        pIdx[k].matched=1;
-        break;
+    if( kStr ){
+      u32 pos = mpKeyHash(kStr,kLen) & phmask;
+      for(;;){
+        int e = phash[pos];
+        if( e<0 ) break;
+        if( pIdx[e].zKey && pIdx[e].nKey==kLen &&
+            memcmp(pIdx[e].zKey,kStr,kLen)==0 ){
+          foundInPatch=1; pMatchVal=pIdx[e].valOff;
+          patchIsNil=(pIdx[e].valOff<np && p[pIdx[e].valOff]==MP_NIL);
+          pIdx[e].matched=1;
+          break;
+        }
+        pos=(pos+1)&phmask;
       }
     }
 
@@ -1363,6 +1707,7 @@ static int mpMergePatch(
     }
     ac=aPairEnd;
   }
+  if(phHeap) sqlite3_free(phash);
 
   /* Phase 2: add patch pairs not already matched in target (O(pCount)) */
   for(u32 k=0; k<pCount; k++){
