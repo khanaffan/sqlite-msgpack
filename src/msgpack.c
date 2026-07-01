@@ -404,6 +404,12 @@ static u32 mpSkipOneD(const u8 *a, u32 n, u32 i, int depth){
   if( b <= 0x7f ) return i;
   /* negative fixint */
   if( b >= 0xe0 ) return i;
+  /* fixstr: 0xa0-0xbf — checked early; it is the most common element type
+  ** (all map keys plus short strings) on the extract/lookup hot path. */
+  if( (b & 0xe0) == 0xa0 ){
+    u32 sz = b & 0x1f;
+    return (i+sz<=n)?i+sz:0;
+  }
 
   switch( b ){
     /* fixed-length scalars */
@@ -505,11 +511,7 @@ static u32 mpSkipOneD(const u8 *a, u32 n, u32 i, int depth){
     for( j=0; j<count; j++ ){ i = mpSkipOneD(a,n,i,depth+1); if(!i&&j<count-1) return 0; }
     return i;
   }
-  /* fixstr: 0xa0-0xbf */
-  if( (b & 0xe0) == 0xa0 ){
-    u32 sz = b & 0x1f;
-    return (i+sz<=n)?i+sz:0;
-  }
+  /* fixstr (0xa0-0xbf) is handled early, before the switch. */
   return 0;
 }
 
@@ -715,20 +717,23 @@ static int mpLookup(
       for( j=0; j<count && !found; j++ ){
         u8 kb;
         const char *kStr = 0;
-        u32 kLen = 0, valOff;
+        u32 kLen = 0, valOff = 0;
         if( iCur >= n ) return SQLITE_ERROR;
         kb = a[iCur];
+        /* Decode the key header and derive the value offset directly, avoiding a
+        ** redundant mpSkipOne() over the (string) key on this hot lookup path. */
         if( kb >= 0xa0 && kb <= 0xbf ){
-          kLen = kb & 0x1f; kStr = (const char*)(a+iCur+1);
+          kLen = kb & 0x1f; kStr = (const char*)(a+iCur+1); valOff = iCur+1+kLen;
         } else if( kb == MP_STR8  && iCur+2 <= n ){
-          kLen = a[iCur+1]; kStr = (const char*)(a+iCur+2);
+          kLen = a[iCur+1]; kStr = (const char*)(a+iCur+2); valOff = iCur+2+kLen;
         } else if( kb == MP_STR16 && iCur+3 <= n ){
-          kLen = mpRead16(a+iCur+1); kStr = (const char*)(a+iCur+3);
+          kLen = mpRead16(a+iCur+1); kStr = (const char*)(a+iCur+3); valOff = iCur+3+kLen;
         } else if( kb == MP_STR32 && iCur+5 <= n ){
-          kLen = mpRead32(a+iCur+1); kStr = (const char*)(a+iCur+5);
+          kLen = mpRead32(a+iCur+1); kStr = (const char*)(a+iCur+5); valOff = iCur+5+kLen;
+        } else {
+          valOff = mpSkipOne(a, n, iCur);   /* non-string key */
         }
-        valOff = mpSkipOne(a, n, iCur);
-        if( !valOff ) return SQLITE_ERROR;
+        if( !valOff || valOff > n ) return SQLITE_ERROR;
         if( kStr && (int)kLen==nKey && memcmp(kStr,zKey,(size_t)nKey)==0 ){
           iCur = valOff;
           found = 1;
