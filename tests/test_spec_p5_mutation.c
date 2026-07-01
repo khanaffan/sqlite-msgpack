@@ -544,6 +544,70 @@ static void test_immutability(sqlite3 *db){
   sqlite3_free(orig_hex); sqlite3_free(original);
 }
 
+/*
+** Phase 5.8: batch fast-path correctness. msgpack_set() / msgpack_remove() apply
+** many top-level "$.<key>" edits in a single rebuild pass, and msgpack_patch()
+** merges via a hashed key lookup. These must be byte-for-byte equivalent to the
+** generic per-edit behavior. Exercises those paths with wide inputs.
+*/
+static void test_batch_fastpath(sqlite3 *db){
+  const int N = 40;
+  char obj[4096]; int off = 0;
+  off += snprintf(obj+off, (size_t)(sizeof obj-off), "msgpack_object(");
+  for(int i=0;i<N;i++) off += snprintf(obj+off,(size_t)(sizeof obj-off),"%s'p%d',%d", i?",":"", i, i);
+  snprintf(obj+off,(size_t)(sizeof obj-off), ")");
+
+  /* Set every key in ONE msgpack_set() call: p<i> := i*10+1. */
+  char setexpr[8192]; int so = 0;
+  so += snprintf(setexpr+so,(size_t)(sizeof setexpr-so), "msgpack_set(%s", obj);
+  for(int i=0;i<N;i++) so += snprintf(setexpr+so,(size_t)(sizeof setexpr-so), ",'$.p%d',%d", i, i*10+1);
+  snprintf(setexpr+so,(size_t)(sizeof setexpr-so), ")");
+
+  char q[8400];
+  snprintf(q,sizeof q,"SELECT msgpack_valid(%s)", setexpr);
+  CHECK("8.1 batch set -> valid blob", exec1i(db,q)==1);
+
+  int allok = 1;
+  for(int i=0;i<N && allok;i++){
+    char qe[8500]; snprintf(qe,sizeof qe,"SELECT msgpack_extract(%s,'$.p%d')", setexpr, i);
+    if(exec1i(db,qe)!=(sqlite3_int64)(i*10+1)) allok = 0;
+  }
+  CHECK("8.2 batch set -> every key updated", allok);
+
+  /* Semantics: replace + append(order) + null + duplicate(last-wins). */
+  { char *r = exec1(db, "SELECT msgpack_to_json(msgpack_set(msgpack_object('a',1,'b',2,'c',3),"
+                        "'$.b',20,'$.d',4,'$.a',null,'$.e',5))");
+    CHECK("8.3 batch set semantics", r && strcmp(r,"{\"a\":null,\"b\":20,\"c\":3,\"d\":4,\"e\":5}")==0);
+    sqlite3_free(r);
+    r = exec1(db, "SELECT msgpack_to_json(msgpack_set(msgpack_object('a',1),'$.a',2,'$.a',3))");
+    CHECK("8.4 batch set duplicate key last-wins", r && strcmp(r,"{\"a\":3}")==0);
+    sqlite3_free(r);
+  }
+
+  /* Batch remove: multiple keys, duplicate path, remove-all -> empty map. */
+  { char *r = exec1(db,"SELECT msgpack_to_json(msgpack_remove(msgpack_object('a',1,'b',2,'c',3),'$.a','$.c'))");
+    CHECK("8.5 batch remove multiple", r && strcmp(r,"{\"b\":2}")==0); sqlite3_free(r);
+    r = exec1(db,"SELECT msgpack_to_json(msgpack_remove(msgpack_object('a',1,'b',2),'$.a','$.a'))");
+    CHECK("8.6 batch remove duplicate path", r && strcmp(r,"{\"b\":2}")==0); sqlite3_free(r);
+  }
+  { char rem[8192]; int ro = 0;
+    ro += snprintf(rem+ro,(size_t)(sizeof rem-ro),"SELECT msgpack_to_json(msgpack_remove(%s", obj);
+    for(int i=0;i<N;i++) ro += snprintf(rem+ro,(size_t)(sizeof rem-ro),",'$.p%d'", i);
+    snprintf(rem+ro,(size_t)(sizeof rem-ro),"))");
+    char *r = exec1(db, rem);
+    CHECK("8.7 batch remove all -> empty map", r && strcmp(r,"{}")==0); sqlite3_free(r);
+  }
+
+  /* Patch (hashed merge): replace/add/null-drop + recursive nested merge. */
+  { char *r = exec1(db,"SELECT msgpack_to_json(msgpack_patch(msgpack_object('a',1,'b',2),"
+                       "msgpack_object('b',20,'c',3,'a',null)))");
+    CHECK("8.8 patch replace/add/drop", r && strcmp(r,"{\"b\":20,\"c\":3}")==0); sqlite3_free(r);
+    r = exec1(db,"SELECT msgpack_to_json(msgpack_patch(msgpack_object('a',msgpack_object('x',1,'y',2)),"
+                 "msgpack_object('a',msgpack_object('y',9))))");
+    CHECK("8.9 patch recursive nested merge", r && strcmp(r,"{\"a\":{\"x\":1,\"y\":9}}")==0); sqlite3_free(r);
+  }
+}
+
 int main(void){
   sqlite3 *db = NULL;
   if(sqlite3_open(":memory:", &db) != SQLITE_OK){ fprintf(stderr,"open failed\n"); return 1; }
@@ -558,6 +622,7 @@ int main(void){
   test_array_insert(db);
   test_patch(db);
   test_immutability(db);
+  test_batch_fastpath(db);
 
   sqlite3_close(db);
   printf("\n%d passed, %d failed\n", g_pass, g_fail);
