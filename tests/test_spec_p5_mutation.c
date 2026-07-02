@@ -548,6 +548,89 @@ static void test_patch(sqlite3 *db){
   }
 }
 
+/* ── msgpack_strip_nulls ─────────────────────────────────────────── */
+
+static void test_strip_nulls(sqlite3 *db){
+  /* Top-level: nil-valued keys dropped, others preserved. */
+  { char *r = exec1(db,
+      "SELECT msgpack_to_json(msgpack_strip_nulls("
+      "  msgpack_object('a',1,'b',NULL,'c',3)))");
+    CHECK("9.1 strip_nulls: top-level nil key dropped",
+      r && strcmp(r,"{\"a\":1,\"c\":3}")==0); sqlite3_free(r);
+  }
+
+  /* Recursive: nil dropped inside a nested map too. */
+  { char *r = exec1(db,
+      "SELECT msgpack_to_json(msgpack_strip_nulls("
+      "  msgpack_object('a', msgpack_object('x',1,'y',NULL), 'b', NULL)))");
+    CHECK("9.2 strip_nulls: recursive nested map",
+      r && strcmp(r,"{\"a\":{\"x\":1}}")==0); sqlite3_free(r);
+  }
+
+  /* Array elements (including literal nulls) are preserved verbatim, but a
+  ** map nested inside an array still has its nil keys stripped. */
+  { char *r = exec1(db,
+      "SELECT msgpack_to_json(msgpack_strip_nulls("
+      "  msgpack_array(1, NULL, msgpack_object('p',1,'q',NULL))))");
+    CHECK("9.3 strip_nulls: array elements untouched, nested map stripped",
+      r && strcmp(r,"[1,null,{\"p\":1}]")==0); sqlite3_free(r);
+  }
+
+  /* All keys nil -> empty map, not removed entirely. */
+  { char *r = exec1(db,
+      "SELECT msgpack_to_json(msgpack_strip_nulls(msgpack_object('a',NULL,'b',NULL)))");
+    CHECK("9.4 strip_nulls: all-nil map becomes {}",
+      r && strcmp(r,"{}")==0); sqlite3_free(r);
+  }
+
+  /* Top-level scalar (non-map) passes through unchanged. */
+  { char *r = exec1(db, "SELECT msgpack_to_json(msgpack_strip_nulls(msgpack_quote(5)))");
+    CHECK("9.5 strip_nulls: scalar passthrough", r && strcmp(r,"5")==0); sqlite3_free(r);
+  }
+
+  /* SQL NULL input -> NULL. */
+  { sqlite3_stmt *s = NULL;
+    sqlite3_prepare_v2(db, "SELECT msgpack_strip_nulls(NULL) IS NULL", -1, &s, NULL);
+    sqlite3_step(s);
+    CHECK("9.6 strip_nulls: NULL input -> NULL", sqlite3_column_int(s,0)==1);
+    sqlite3_finalize(s);
+  }
+
+  /* Deeply/widely nested: nils stripped at every level, non-nil values and
+  ** array elements survive untouched. */
+  { char *r = exec1(db,
+      "SELECT msgpack_to_json(msgpack_strip_nulls("
+      "  msgpack_object("
+      "    'keep', 1,"
+      "    'drop', NULL,"
+      "    'nested', msgpack_object('a',NULL,'b',msgpack_array(NULL,2,msgpack_object('c',NULL,'d',4))))))");
+    CHECK("9.7 strip_nulls: deep nesting through map+array+map",
+      r && strcmp(r,"{\"keep\":1,\"nested\":{\"b\":[null,2,{\"d\":4}]}}")==0);
+    sqlite3_free(r);
+  }
+
+  /* Result is strictly smaller (or equal) in byte size after stripping. */
+  { sqlite3_stmt *s = NULL; sqlite3_int64 before=-1, after=-1;
+    sqlite3_prepare_v2(db,
+      "SELECT length(msgpack_object('a',1,'b',NULL,'c',NULL,'d',NULL,'e',NULL)),"
+      "       length(msgpack_strip_nulls(msgpack_object('a',1,'b',NULL,'c',NULL,'d',NULL,'e',NULL)))",
+      -1, &s, NULL);
+    if(sqlite3_step(s)==SQLITE_ROW){ before=sqlite3_column_int64(s,0); after=sqlite3_column_int64(s,1); }
+    CHECK("9.8 strip_nulls: shrinks encoded size", before>0 && after>0 && after<before);
+    sqlite3_finalize(s);
+  }
+
+  /* Malformed input (bogus MAP32 count) rejected, not crash. */
+  { sqlite3_stmt *s = NULL;
+    unsigned char bad32[] = { 0xdf, 0x80, 0x00, 0x00, 0x01, 0x31, 0x01, 0x02 };
+    sqlite3_prepare_v2(db, "SELECT msgpack_strip_nulls(?)", -1, &s, NULL);
+    sqlite3_bind_blob(s, 1, bad32, (int)sizeof bad32, SQLITE_STATIC);
+    int rc = sqlite3_step(s);
+    CHECK("9.9 strip_nulls: bogus MAP32 count rejected (no overflow)", rc == SQLITE_ERROR);
+    sqlite3_finalize(s);
+  }
+}
+
 /* ── immutability / original unmodified ─────────────────────────── */
 
 static void test_immutability(sqlite3 *db){
@@ -658,6 +741,7 @@ int main(void){
   test_remove(db);
   test_array_insert(db);
   test_patch(db);
+  test_strip_nulls(db);
   test_immutability(db);
   test_batch_fastpath(db);
 

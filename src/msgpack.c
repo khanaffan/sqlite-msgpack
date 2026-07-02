@@ -29,6 +29,7 @@
 **     msgpack_remove(mp, path, ...)      -- remove element(s)
 **     msgpack_array_insert(mp, path, v)  -- insert before index
 **     msgpack_patch(mp, patch)           -- RFC 7386 merge-patch
+**     msgpack_strip_nulls(mp)            -- recursively drop nil-valued map keys
 **
 **   JSON conversion
 **     msgpack_from_json(json_text)       -- JSON → msgpack
@@ -1880,6 +1881,101 @@ static int mpMergePatch(
   return SQLITE_OK;
 }
 
+/*
+** mpStripNulls — recursively rebuild a msgpack value, dropping any map key
+** whose value is MP_NIL.  Recurses into nested maps and into maps/arrays
+** nested inside arrays; array elements themselves are never dropped (only
+** map keys), so array length/order is always preserved.  Scalars pass
+** through unchanged.
+*/
+static int mpStripNulls(
+  MpBuf *out,
+  const u8 *a, u32 n, u32 i,
+  int depth
+){
+  if(i>=n) return SQLITE_ERROR;
+  if(depth>MP_MAX_DEPTH) return SQLITE_ERROR;
+  u8 b = a[i];
+  int isMap   = (b>=0x80&&b<=0x8f)||b==MP_MAP16||b==MP_MAP32;
+  int isArray = (b>=0x90&&b<=0x9f)||b==MP_ARRAY16||b==MP_ARRAY32;
+
+  if(isMap){
+    u32 count, dataOff;
+    if(b>=0x80&&b<=0x8f)  { count=b&0x0f;          dataOff=i+1; }
+    else if(b==MP_MAP16)  {
+      if(i+3>n) return SQLITE_ERROR;
+      count=mpRead16(a+i+1);  dataOff=i+3;
+    } else {
+      if(i+5>n) return SQLITE_ERROR;
+      count=mpRead32(a+i+1);  dataOff=i+5;
+    }
+    /* Every pair needs >=2 bytes (>=1-byte key + >=1-byte value); reject a
+    ** declared count that cannot fit in the remaining buffer before doing
+    ** any work (guards against malformed/adversarial input). */
+    if(count > (n-dataOff)/2) return SQLITE_ERROR;
+
+    MpBuf tmp; mpBufInit(&tmp, out->pCtx);
+    u32 newCount=0, c=dataOff;
+    for(u32 k=0; k<count; k++){
+      if(c>=n){ mpBufReset(&tmp); return SQLITE_ERROR; }
+      u32 valOff = mpSkipOne(a,n,c);
+      if(!valOff){ mpBufReset(&tmp); return SQLITE_ERROR; }
+      u32 pairEnd = mpSkipOne(a,n,valOff);
+      if(!pairEnd){ mpBufReset(&tmp); return SQLITE_ERROR; }
+
+      if(a[valOff]!=MP_NIL){
+        MpBuf mb; mpBufInit(&mb,out->pCtx);
+        int rc = mpStripNulls(&mb, a,n,valOff, depth+1);
+        if(rc!=SQLITE_OK){ mpBufReset(&mb); mpBufReset(&tmp); return rc; }
+        mpBufAppend(&tmp, a+c, valOff-c);      /* key, verbatim */
+        mpBufAppend(&tmp, mb.aBuf, mb.nUsed);  /* stripped value */
+        mpBufReset(&mb);
+        newCount++;
+      }
+      c = pairEnd;
+    }
+    if( tmp.bErr ){ mpBufReset(&tmp); return SQLITE_NOMEM; }
+    mpEncodeMapHeader(out, newCount);
+    mpBufAppend(out, tmp.aBuf, tmp.nUsed);
+    mpBufReset(&tmp);
+    return out->bErr ? SQLITE_NOMEM : SQLITE_OK;
+
+  } else if(isArray){
+    u32 count, dataOff;
+    if(b>=0x90&&b<=0x9f)   { count=b&0x0f;          dataOff=i+1; }
+    else if(b==MP_ARRAY16) {
+      if(i+3>n) return SQLITE_ERROR;
+      count=mpRead16(a+i+1);  dataOff=i+3;
+    } else {
+      if(i+5>n) return SQLITE_ERROR;
+      count=mpRead32(a+i+1);  dataOff=i+5;
+    }
+    /* Every element needs >=1 byte. */
+    if(count > n-dataOff) return SQLITE_ERROR;
+
+    /* Element count is unchanged (array elements are never dropped), so the
+    ** header can be written immediately and every element recursed straight
+    ** into out; on error the caller discards the whole buffer. */
+    mpEncodeArrayHeader(out, count);
+    u32 c=dataOff;
+    for(u32 k=0; k<count; k++){
+      if(c>=n) return SQLITE_ERROR;
+      int rc = mpStripNulls(out, a,n,c, depth+1);
+      if(rc!=SQLITE_OK) return rc;
+      u32 next = mpSkipOne(a,n,c);
+      if(!next) return SQLITE_ERROR;
+      c = next;
+    }
+    return out->bErr ? SQLITE_NOMEM : SQLITE_OK;
+
+  } else {
+    u32 end = mpSkipOne(a,n,i);
+    if(!end) return SQLITE_ERROR;
+    mpBufAppend(out, a+i, end-i);
+    return out->bErr ? SQLITE_NOMEM : SQLITE_OK;
+  }
+}
+
 /* ---- SQL wrapper functions ---- */
 static void msgpackSetFunc(
   sqlite3_context *ctx, int argc, sqlite3_value **argv
@@ -1916,6 +2012,39 @@ static void msgpackPatchFunc(
   } else {
     mpBufReset(&out);
     sqlite3_result_error(ctx,"msgpack_patch error",-1);
+  }
+}
+
+/*
+** msgpack_strip_nulls(blob) → BLOB
+** Recursively remove map keys whose value is nil, shrinking the encoded
+** size.  Array elements (including nil ones) are always preserved so
+** ordering/indices never change.  NULL → NULL; malformed msgpack → error.
+*/
+static void msgpackStripNullsFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  const u8 *a; u32 n;
+  (void)argc;
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ){
+    sqlite3_result_null(ctx); return;
+  }
+  if( sqlite3_value_type(argv[0])!=SQLITE_BLOB ){
+    sqlite3_result_error(ctx, "msgpack_strip_nulls() requires a BLOB argument", -1); return;
+  }
+  a=(const u8*)sqlite3_value_blob(argv[0]); n=(u32)sqlite3_value_bytes(argv[0]);
+  if(n==0){ sqlite3_result_error(ctx, "invalid msgpack data", -1); return; }
+  MpBuf out; mpBufInit(&out,ctx);
+  int rc=mpStripNulls(&out, a,n,0, 0);
+  if(rc==SQLITE_OK){
+    u32 nOut; u8 *res=mpBufFinish(&out,&nOut);
+    if(res) sqlite3_result_blob(ctx,res,(int)nOut,sqlite3_free);
+  } else if(rc==SQLITE_NOMEM){
+    mpBufReset(&out);
+    sqlite3_result_error_nomem(ctx);
+  } else {
+    mpBufReset(&out);
+    sqlite3_result_error(ctx,"invalid msgpack data",-1);
   }
 }
 
@@ -4453,6 +4582,10 @@ int sqlite3_msgpack_init(
   rc = sqlite3_create_function_v2(db, "msgpack_patch", 2,
          SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
          0, msgpackPatchFunc, 0, 0, 0);
+  if( rc ) return rc;
+  rc = sqlite3_create_function_v2(db, "msgpack_strip_nulls", 1,
+         SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+         0, msgpackStripNullsFunc, 0, 0, 0);
   if( rc ) return rc;
 
   /* Phase 5: Conversion */
