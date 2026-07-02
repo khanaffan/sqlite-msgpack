@@ -427,6 +427,28 @@ SELECT msgpack_to_json(
 -- {"a":1,"c":3}
 ```
 
+#### `msgpack_strip_nulls(mp)`
+
+Recursively removes every map key whose value is `nil`, shrinking the
+encoded size. Recurses into nested maps, including maps nested inside
+arrays. Array **elements** are always preserved (a literal `null` inside
+an array stays), so array length/order never changes — only map keys are
+dropped.
+
+```sql
+SELECT msgpack_to_json(
+  msgpack_strip_nulls(msgpack_from_json('{"a":1,"b":null,"c":{"x":null,"y":2}}'))
+);
+-- {"a":1,"c":{"y":2}}
+
+SELECT msgpack_to_json(msgpack_strip_nulls(msgpack_array(1, null, 3)));
+-- [1,null,3]   (array elements untouched)
+
+-- Shrinks storage for sparse wide records:
+SELECT length(mp), length(msgpack_strip_nulls(mp))
+FROM (SELECT msgpack_object('a',1,'b',NULL,'c',NULL,'d',NULL) AS mp);
+```
+
 ---
 
 ### JSON conversion

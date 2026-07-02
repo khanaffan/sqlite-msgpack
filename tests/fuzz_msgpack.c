@@ -38,6 +38,7 @@ static sqlite3_stmt *g_arrlen       = NULL;
 static sqlite3_stmt *g_errpos       = NULL;
 static sqlite3_stmt *g_quote        = NULL;
 static sqlite3_stmt *g_msgpack      = NULL;
+static sqlite3_stmt *g_strip_nulls  = NULL;
 
 /* 2-arg path variants: (?1 = blob, ?2 = path text) */
 static sqlite3_stmt *g_valid_path   = NULL;
@@ -142,6 +143,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
   prep(&g_errpos,   "SELECT msgpack_error_position(?1)");
   prep(&g_quote,    "SELECT msgpack_quote(?1)");
   prep(&g_msgpack,  "SELECT hex(msgpack(?1))");
+  prep(&g_strip_nulls, "SELECT hex(msgpack_strip_nulls(?1))");
 
   /* ── 2-arg path variants ────────────────────────────────────────── */
   prep(&g_valid_path,  "SELECT msgpack_valid(?1, ?2)");
@@ -263,6 +265,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   run_blob(g_errpos,  data, size);
   run_blob(g_quote,   data, size);
   run_blob(g_msgpack, data, size);
+  run_blob(g_strip_nulls, data, size);
 
   if (size <= 256) {
     run_blob(g_pretty, data, size);
