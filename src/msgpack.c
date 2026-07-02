@@ -166,6 +166,150 @@ static void mpWrite64(u8 *p, u64 v){
 
 /*
 ** ============================================================
+** SIMD byte scanners (JSON string fast paths)
+** ============================================================
+**
+** MessagePack navigation (mpSkipOne/mpLookup) is a serial length-prefixed
+** pointer-chase and cannot be vectorized.  The one place byte throughput
+** dominates is scanning JSON *string* bodies during msgpack<->JSON
+** conversion:
+**
+**   mpJpParseString  (from_json)  — scan for '"' or '\\'
+**   mpJsonEscapeStr  (to_json)    — scan for '"', '\\' or a control byte (<0x20)
+**
+** Both loops previously advanced one byte at a time.  The helpers below find
+** the first "interesting" byte in a run using 128-bit SIMD (ARM NEON or x86
+** SSE2), letting the callers bulk-copy the safe span in between.  Only full
+** 16-byte loads are used (i+16<=len) so we never read past the buffer; the
+** short tail falls back to a scalar loop.  Only the always-available 128-bit
+** baseline ISA is used, so no runtime CPU dispatch is required.
+**
+** Define MSGPACK_DISABLE_SIMD to force the portable scalar path (used to
+** A/B benchmark the speedup, and for exotic targets).
+*/
+#if !defined(MSGPACK_DISABLE_SIMD)
+#  if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#    include <arm_neon.h>
+#    define MSGPACK_HAVE_NEON 1
+#  elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP>=2)))
+#    include <emmintrin.h>
+#    define MSGPACK_HAVE_SSE2 1
+#  endif
+#endif
+#ifndef MSGPACK_HAVE_NEON
+#  define MSGPACK_HAVE_NEON 0
+#endif
+#ifndef MSGPACK_HAVE_SSE2
+#  define MSGPACK_HAVE_SSE2 0
+#endif
+
+#if MSGPACK_HAVE_NEON
+/* Index (0..15) of the first matching lane in a NEON compare result whose
+** lanes are 0x00 (no match) or 0xff (match), or 16 if none matched.
+** Uses the shift-narrow trick: each source byte becomes a nibble in a 64-bit
+** word, so (ctz/4) is the byte index of the first match. */
+static inline u32 mpSimdFirstNeon(uint8x16_t cmp){
+  uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4);
+  u64 m = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
+  if( m==0 ) return 16;
+  return (u32)(__builtin_ctzll(m) >> 2);
+}
+#endif
+#if MSGPACK_HAVE_SSE2
+#  if defined(_MSC_VER)
+#    include <intrin.h>
+#  endif
+/* Index (0..15) of the first matching byte in an SSE2 compare result, or 16. */
+static inline u32 mpSimdFirstSse(__m128i cmp){
+  unsigned m = (unsigned)_mm_movemask_epi8(cmp);
+  if( m==0 ) return 16;
+#  if defined(_MSC_VER)
+  { unsigned long idx; _BitScanForward(&idx, m); return (u32)idx; }
+#  else
+  return (u32)__builtin_ctz(m);
+#  endif
+}
+#endif
+
+/* Return the offset of the first byte in s[0..len) equal to '"' or '\\',
+** or len if there is none. */
+static u32 mpScanStr(const u8 *s, u32 len){
+  u32 i = 0;
+#if MSGPACK_HAVE_NEON || MSGPACK_HAVE_SSE2
+  /* Cheap first-byte check: on escape-dense input (matches back-to-back) this
+  ** returns immediately, avoiding SIMD load/compare setup cost per byte. */
+  if( len && (s[0]=='"' || s[0]=='\\') ) return 0;
+#endif
+#if MSGPACK_HAVE_NEON
+  const uint8x16_t vq  = vdupq_n_u8('"');
+  const uint8x16_t vbs = vdupq_n_u8('\\');
+  for( ; i+16<=len; i+=16 ){
+    uint8x16_t v = vld1q_u8(s+i);
+    uint8x16_t m = vorrq_u8(vceqq_u8(v,vq), vceqq_u8(v,vbs));
+    u32 k = mpSimdFirstNeon(m);
+    if( k<16 ) return i+k;
+  }
+#elif MSGPACK_HAVE_SSE2
+  const __m128i vq  = _mm_set1_epi8('"');
+  const __m128i vbs = _mm_set1_epi8('\\');
+  for( ; i+16<=len; i+=16 ){
+    __m128i v = _mm_loadu_si128((const __m128i*)(s+i));
+    __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v,vq), _mm_cmpeq_epi8(v,vbs));
+    u32 k = mpSimdFirstSse(m);
+    if( k<16 ) return i+k;
+  }
+#endif
+  for( ; i<len; i++ ){
+    u8 c = s[i];
+    if( c=='"' || c=='\\' ) return i;
+  }
+  return len;
+}
+
+/* Return the offset of the first byte in s[0..len) that needs JSON escaping,
+** i.e. a control byte (<0x20), '"' or '\\'; or len if there is none. */
+static u32 mpScanEsc(const u8 *s, u32 len){
+  u32 i = 0;
+#if MSGPACK_HAVE_NEON || MSGPACK_HAVE_SSE2
+  /* Cheap first-byte check: on escape-dense input (matches back-to-back) this
+  ** returns immediately, avoiding SIMD load/compare setup cost per byte. */
+  if( len && (s[0]<0x20 || s[0]=='"' || s[0]=='\\') ) return 0;
+#endif
+#if MSGPACK_HAVE_NEON
+  const uint8x16_t vq  = vdupq_n_u8('"');
+  const uint8x16_t vbs = vdupq_n_u8('\\');
+  const uint8x16_t vsp = vdupq_n_u8(0x20);
+  for( ; i+16<=len; i+=16 ){
+    uint8x16_t v = vld1q_u8(s+i);
+    uint8x16_t m = vcltq_u8(v, vsp);              /* v < 0x20 */
+    m = vorrq_u8(m, vceqq_u8(v,vq));
+    m = vorrq_u8(m, vceqq_u8(v,vbs));
+    u32 k = mpSimdFirstNeon(m);
+    if( k<16 ) return i+k;
+  }
+#elif MSGPACK_HAVE_SSE2
+  const __m128i vq  = _mm_set1_epi8('"');
+  const __m128i vbs = _mm_set1_epi8('\\');
+  const __m128i vlo = _mm_set1_epi8(0x1f);
+  for( ; i+16<=len; i+=16 ){
+    __m128i v  = _mm_loadu_si128((const __m128i*)(s+i));
+    /* v < 0x20 (unsigned) <=> min(v,0x1f)==v */
+    __m128i lt = _mm_cmpeq_epi8(_mm_min_epu8(v, vlo), v);
+    __m128i m  = _mm_or_si128(lt, _mm_cmpeq_epi8(v,vq));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v,vbs));
+    u32 k = mpSimdFirstSse(m);
+    if( k<16 ) return i+k;
+  }
+#endif
+  for( ; i<len; i++ ){
+    u8 c = s[i];
+    if( c<0x20 || c=='"' || c=='\\' ) return i;
+  }
+  return len;
+}
+
+/*
+** ============================================================
 ** MpBuf — growable output buffer (stack-allocated until it grows)
 ** ============================================================
 */
@@ -2056,9 +2200,13 @@ static void mpJsonEscapeStr(MpBuf *out, const u8 *s, u32 len){
   u32 j, start;
   mpBufAppend1(out, '"');
   start = 0;
-  for( j=0; j<len; j++ ){
-    u8 c = s[j];
-    if( c>=0x20 && c!='"' && c!='\\' ) continue;
+  j = 0;
+  while( j<len ){
+    u8 c;
+    /* SIMD: skip to the next byte that must be escaped. */
+    j += mpScanEsc(s+j, len-j);
+    if( j>=len ) break;
+    c = s[j];
     /* Flush buffered safe characters */
     if( j>start ) mpBufAppend(out, s+start, j-start);
     if( c=='"' ){
@@ -2076,6 +2224,7 @@ static void mpJsonEscapeStr(MpBuf *out, const u8 *s, u32 len){
       mpBufAppend(out,(const u8*)esc,6);
     }
     start = j+1;
+    j++;
   }
   /* Flush remaining safe characters */
   if( len>start ) mpBufAppend(out, s+start, len-start);
@@ -2292,6 +2441,14 @@ static int mpJpParseString(MpJsonParser *p, MpBuf *out){
   mpBufInit(&sb, out->pCtx);
   p->i++; /* skip '"' */
   while(p->i<p->n){
+    /* SIMD fast path: copy the run of ordinary bytes up to the next
+    ** '"' (end) or '\\' (escape) in a single bulk append. */
+    u32 run = mpScanStr((const u8*)p->z + p->i, (u32)(p->n - p->i));
+    if( run ){
+      mpBufAppend(&sb, (const u8*)p->z + p->i, run);
+      p->i += (int)run;
+      if( p->i>=p->n ) break;
+    }
     unsigned char c=(unsigned char)p->z[p->i];
     if(c=='"'){ p->i++; break; }
     if(c=='\\'){

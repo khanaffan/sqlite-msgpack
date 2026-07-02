@@ -165,6 +165,17 @@ int main(void){
         "  jsonb_object('id',1,'name','Alice','score',9.5,'active',1)   AS jb;",
         NULL, NULL, NULL);
 
+    /* ── Setup: large string payloads for the SIMD string-path benchmarks ──
+    ** hex(zeroblob(2048)) is a 4096-char ASCII string with no bytes that need
+    ** JSON escaping (best case for SIMD bulk-copy); replacing every '0' with a
+    ** '"' yields an all-escapes worst case where safe runs are empty. */
+    sqlite3_exec(g_db,
+        "CREATE TEMP TABLE bigstr AS SELECT"
+        "  '\"' || hex(zeroblob(2048)) || '\"'                  AS from_plain_js,"
+        "  msgpack_quote(hex(zeroblob(2048)))                   AS to_plain_mp,"
+        "  msgpack_quote(replace(hex(zeroblob(2048)),'0','\"')) AS to_esc_mp;",
+        NULL, NULL, NULL);
+
     /* Iteration counts tuned so each scenario takes ~0.5–2 s on a modern machine */
     const int N_BUILD   = 200000;
     const int N_EXTRACT = 400000;
@@ -269,6 +280,21 @@ int main(void){
     print_row("to_json (serialise blob → JSON text)",
         bench_expr("SELECT msgpack_to_json(mp) FROM src", N_EXTRACT),
         -1.0 /* baseline */, -1.0);
+
+    /* ── Large-string SIMD string paths (msgpack-only baseline) ─────────────── */
+    const int N_BIGSTR = 50000;
+
+    print_row("from_json large str (~4 KB, no escapes)",
+        bench_expr("SELECT msgpack_from_json(from_plain_js) FROM bigstr", N_BIGSTR),
+        -1.0, -1.0);
+
+    print_row("to_json large str (~4 KB, no escapes)",
+        bench_expr("SELECT msgpack_to_json(to_plain_mp) FROM bigstr", N_BIGSTR),
+        -1.0, -1.0);
+
+    print_row("to_json large str (~4 KB, all escapes)",
+        bench_expr("SELECT msgpack_to_json(to_esc_mp) FROM bigstr", N_BIGSTR),
+        -1.0, -1.0);
 
     printf("\n<!-- BENCH_END -->\n");
 
