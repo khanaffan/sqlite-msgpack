@@ -172,6 +172,20 @@ static unsigned char *apply_patch(sqlite3 *db,
   sqlite3_finalize(s); return r;
 }
 
+/* Run msgpack_patch(target,patch) with raw (possibly malformed) blobs and
+** return the sqlite3_step() result code.  Used to prove that malformed patches
+** are rejected gracefully (SQLITE_ERROR) instead of crashing. */
+static int patch_status(sqlite3 *db,
+    const void *target, int ntarget,
+    const void *patch, int npatch){
+  sqlite3_stmt *s = NULL; int rc;
+  sqlite3_prepare_v2(db, "SELECT msgpack_patch(?,?)", -1, &s, NULL);
+  sqlite3_bind_blob(s, 1, target, ntarget, SQLITE_STATIC);
+  sqlite3_bind_blob(s, 2, patch,  npatch,  SQLITE_STATIC);
+  rc = sqlite3_step(s);
+  sqlite3_finalize(s); return rc;
+}
+
 #ifdef SQLITE_CORE
 int sqlite3_msgpack_init(sqlite3*, char**, const sqlite3_api_routines*);
 #endif
@@ -508,6 +522,29 @@ static void test_patch(sqlite3 *db){
       "  ),"
       "  '$.b')");
     CHECK("6.9 patch adds new key $.b=2 (SQL text)", r && strcmp(r,"2")==0); sqlite3_free(r);
+  }
+
+  /* Regression (fuzz): a map header that declares far more pairs than the
+  ** buffer can hold must be rejected, not crash.  Previously an MP_MAP32 count
+  ** such as 0x80000001 overflowed the signed-int index allocation, causing a
+  ** heap-buffer-overflow in mpMergePatch. */
+  {
+    unsigned char target[] = { 0x80 };  /* empty fixmap {} */
+
+    /* MP_MAP32 declaring 0x80000001 pairs, only a couple of bytes of body. */
+    unsigned char bad32[] = { 0xdf, 0x80, 0x00, 0x00, 0x01, 0x31, 0x01, 0x02 };
+    CHECK("6.10 patch: bogus MAP32 count rejected (no overflow)",
+      patch_status(db, target, (int)sizeof target, bad32, (int)sizeof bad32) == SQLITE_ERROR);
+
+    /* MP_MAP16 declaring 0xFFFF pairs with an almost-empty body. */
+    unsigned char bad16[] = { 0xde, 0xff, 0xff, 0xa1, 0x6b, 0x01 };
+    CHECK("6.11 patch: bogus MAP16 count rejected (no overflow)",
+      patch_status(db, target, (int)sizeof target, bad16, (int)sizeof bad16) == SQLITE_ERROR);
+
+    /* Truncated MP_MAP32 header (fewer than 5 bytes) must also be rejected. */
+    unsigned char trunc[] = { 0xdf, 0xff, 0xff };
+    CHECK("6.12 patch: truncated MAP32 header rejected",
+      patch_status(db, target, (int)sizeof target, trunc, (int)sizeof trunc) == SQLITE_ERROR);
   }
 }
 
