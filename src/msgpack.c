@@ -1733,6 +1733,13 @@ static int mpMergePatch(
     pCount=mpRead32(p+ip+1);  pDataOff=ip+5;
   }
 
+  /* Every map pair needs at least 2 bytes (>=1-byte key + >=1-byte value), so a
+  ** valid map cannot declare more than (np-pDataOff)/2 pairs.  Reject counts
+  ** that cannot fit in the remaining buffer.  Besides rejecting malformed or
+  ** truncated input early, this bounds pCount so the index allocations below
+  ** cannot overflow.  (pDataOff<=np is guaranteed above.) */
+  if( pCount > (np - pDataOff)/2 ) return SQLITE_ERROR;
+
   u32 aCount=0, aDataOff=0;
   if(aIsMap){
     if(ab>=0x80&&ab<=0x8f)    { aCount=ab&0x0f;           aDataOff=ia+1; }
@@ -1749,7 +1756,7 @@ static int mpMergePatch(
   MpPatchEntry pStack[16];
   MpPatchEntry *pIdx = pStack;
   if( pCount > 16 ){
-    pIdx = (MpPatchEntry*)sqlite3_malloc(pCount * sizeof(MpPatchEntry));
+    pIdx = (MpPatchEntry*)sqlite3_malloc64((sqlite3_uint64)pCount * sizeof(MpPatchEntry));
     if( !pIdx ) return SQLITE_NOMEM;
   }
   { u32 k, pc2 = pDataOff;
@@ -1780,7 +1787,7 @@ static int mpMergePatch(
   int  phHeap = 0;
   while( phSize < pCount*2 ) phSize <<= 1;
   if( phSize > 64 ){
-    phash = (int*)sqlite3_malloc((int)(sizeof(int)*phSize));
+    phash = (int*)sqlite3_malloc64((sqlite3_uint64)sizeof(int)*phSize);
     if( !phash ){ mpBufReset(&tmp); if(pIdx!=pStack) sqlite3_free(pIdx); return SQLITE_NOMEM; }
     phHeap = 1;
   }
