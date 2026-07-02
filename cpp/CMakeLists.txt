@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(msgpack_blob VERSION 1.6.0 LANGUAGES CXX)
+project(msgpack_blob VERSION 1.7.0 LANGUAGES CXX)
 
 # ── Standalone C++ MessagePack Blob library (no SQLite dependency) ─────────────
 # A self-contained package — the C++ sibling of the python/, js/, rust/ and go/
