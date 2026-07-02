@@ -1993,6 +1993,307 @@ static void msgpackObjectFunc(
 */
 
 /*
+** ---------------------------------------------------------------------------
+** msgpack_extract() multi-path acceleration.
+**
+** A call such as  msgpack_extract(mp, '$.p0', '$.p1', ..., '$.pK')  originally
+** resolved every path independently with mpLookup(), each of which re-scans the
+** container from the start — O(K*N) for a K-path request over an N-element
+** container.  When the root is a container and every path is a single component
+** ($.key or $[idx]), the helpers below gather all requested elements in ONE
+** linear walk of the container (O(N)), indexing the requests so each element is
+** matched in O(1).  The returned bytes are byte-for-byte identical to the
+** original per-path resolution.
+**
+** Paths are parsed locally per call (borrowing the argument text, which is valid
+** for the duration of the call).  Per-argument sqlite3_set_auxdata() is
+** deliberately NOT used here: SQLite stores auxdata in a per-statement linked
+** list, so sqlite3_get_auxdata() is O(#auxdata entries); caching one entry per
+** path would make a K-path call O(K^2) to look up — worse than simply parsing
+** each short path string, which is O(1) per path.
+**
+** Anything not covered by the fast path (few paths, non-simple paths,
+** non-container root, malformed input, OOM) transparently falls back to the
+** original per-path mpLookup() loop, so behaviour is unchanged in every case.
+** ---------------------------------------------------------------------------
+*/
+
+/* Parsed msgpack_extract path.  All pointers borrow the argument text and are
+** valid only for the duration of the function call. */
+typedef struct MpPath {
+  const char *zPath;   /* the raw path text (borrowed)                        */
+  int         simple;  /* 1 => single component off the root ($.key or $[idx])*/
+  int         kind;    /* 'k' (map key) or 'i' (array index) when simple      */
+  const char *zKey;    /* key bytes (into zPath) when kind=='k'               */
+  int         nKey;    /* key length when kind=='k'                           */
+  i64         idx;     /* index when kind=='i'                                */
+} MpPath;
+
+/* Parse a path string into *p, borrowing zPath (no allocation). */
+static void mpPathParse(MpPath *p, const char *zPath){
+  p->zPath = zPath; p->simple = 0; p->kind = 0; p->zKey = 0; p->nKey = 0; p->idx = 0;
+  if( !zPath || zPath[0]!='$' ) return;
+  {
+    int pi = 1;
+    const char *zKey = 0; int nKey = 0; i64 idx = 0;
+    int step = mpPathStep(zPath, &pi, &zKey, &nKey, &idx);
+    if( step=='k' || step=='i' ){
+      const char *zk2 = 0; int nk2 = 0; i64 id2 = 0;
+      if( mpPathStep(zPath, &pi, &zk2, &nk2, &id2)==0 ){ /* nothing after it */
+        p->simple = 1; p->kind = step;
+        p->zKey = zKey; p->nKey = nKey; p->idx = idx;
+      }
+    }
+  }
+}
+
+/* Below this many paths, a linear compare per element is cheaper than building
+** an index; at or above it the single pass indexes requests for O(1) match. */
+#define MP_MULTI_HASH_MIN 16
+
+/* mpKeyHash() (FNV-1a over key bytes) is defined earlier and reused here. */
+
+/* Single linear pass over a map root at offset 0, resolving every "simple" key
+** path.  Fills aStart/aEnd/aFound (indexed by path).  Returns 1 on success, or
+** 0 to request the caller fall back (malformed structure or OOM). Byte ranges
+** match exactly what mpLookup() would have produced for each path.
+**
+** The requested keys are indexed in an open-addressing hash (with per-key chains
+** for duplicate paths), so matching each of the N map entries is O(1) and the
+** whole pass is O(N + nPath) rather than O(N*nPath). Only called for
+** nPath >= MP_MULTI_HASH_MIN, where the index build pays off. */
+static int mpScanMap(const u8 *a, u32 n,
+                     const MpPath *paths, int nPath,
+                     u32 *aStart, u32 *aEnd, u8 *aFound){
+  u8 b = a[0];
+  u32 count, elemOff, j, iCur;
+  int r, h, remaining = 0;
+  int *htab, *chain, cap;
+  if( b>=0x80 && b<=0x8f ){ count = b & 0x0f;         elemOff = 1; }
+  else if( b==MP_MAP16 ){ if(3>n) return 0; count = mpRead16(a+1); elemOff = 3; }
+  else if( b==MP_MAP32 ){ if(5>n) return 0; count = mpRead32(a+1); elemOff = 5; }
+  else return 0;
+  for( r=0; r<nPath; r++ ){
+    aFound[r] = 0;
+    if( paths[r].kind=='k' ) remaining++;  /* 'i' paths can't match a map */
+  }
+  if( remaining==0 ) return 1;              /* nothing to find → all NIL */
+
+  cap = 1; while( cap < nPath*2 ) cap <<= 1;
+  htab  = (int*)sqlite3_malloc((int)(sizeof(int)*cap));
+  chain = (int*)sqlite3_malloc((int)(sizeof(int)*nPath));
+  if( !htab || !chain ){ sqlite3_free(htab); sqlite3_free(chain); return 0; }
+  for( h=0; h<cap; h++ ) htab[h] = -1;
+  for( r=0; r<nPath; r++ ){
+    chain[r] = -1;
+    if( paths[r].kind!='k' ) continue;
+    h = (int)(mpKeyHash(paths[r].zKey,(u32)paths[r].nKey) & (u32)(cap-1));
+    while( htab[h]!=-1
+        && !(paths[htab[h]].nKey==paths[r].nKey
+          && memcmp(paths[htab[h]].zKey, paths[r].zKey, (size_t)paths[r].nKey)==0) )
+      h = (h+1) & (cap-1);
+    chain[r] = htab[h];   /* -1 for empty slot, else head of same-key chain */
+    htab[h]  = r;
+  }
+
+  iCur = elemOff;
+  for( j=0; j<count && remaining>0; j++ ){
+    u8 kb;
+    const char *kStr = 0;
+    u32 kLen = 0, kStart = 0, valOff = 0, valEnd;
+    if( iCur >= n ){ sqlite3_free(htab); sqlite3_free(chain); return 0; }
+    kb = a[iCur];
+    /* Decode the key header (same fast path as mpLookup).  For a string key,
+    ** kStart is the offset of the key bytes; the header bounds checks guarantee
+    ** kStart<=n, so the value offset is validated below WITHOUT the u32 wrap that
+    ** a large (malformed) STR32 length could otherwise use to slip past valOff>n
+    ** and drive an out-of-bounds read in mpKeyHash()/memcmp(). Non-string keys
+    ** are skipped structurally. */
+    if( kb>=0xa0 && kb<=0xbf ){
+      kLen = kb & 0x1f;          kStart = iCur+1; kStr = (const char*)(a+kStart);
+    } else if( kb==MP_STR8  && iCur+2<=n ){
+      kLen = a[iCur+1];          kStart = iCur+2; kStr = (const char*)(a+kStart);
+    } else if( kb==MP_STR16 && iCur+3<=n ){
+      kLen = mpRead16(a+iCur+1); kStart = iCur+3; kStr = (const char*)(a+kStart);
+    } else if( kb==MP_STR32 && iCur+5<=n ){
+      kLen = mpRead32(a+iCur+1); kStart = iCur+5; kStr = (const char*)(a+kStart);
+    }
+    if( kStr ){
+      if( kLen > n - kStart ){ sqlite3_free(htab); sqlite3_free(chain); return 0; }
+      valOff = kStart + kLen;               /* guaranteed <= n, no wrap */
+    } else {
+      valOff = mpSkipOne(a, n, iCur);       /* non-string key */
+    }
+    if( !valOff || valOff>n ){ sqlite3_free(htab); sqlite3_free(chain); return 0; }
+    valEnd = mpSkipOne(a, n, valOff);
+    if( !valEnd ){ sqlite3_free(htab); sqlite3_free(chain); return 0; }
+    if( kStr ){
+      h = (int)(mpKeyHash(kStr,kLen) & (u32)(cap-1));
+      while( htab[h]!=-1 ){
+        int e = htab[h];
+        if( paths[e].nKey==(int)kLen
+         && memcmp(paths[e].zKey, kStr, (size_t)kLen)==0 ){
+          int x;
+          for( x=e; x!=-1; x=chain[x] )
+            if( !aFound[x] ){ aStart[x]=valOff; aEnd[x]=valEnd; aFound[x]=1; remaining--; }
+          break;
+        }
+        h = (h+1) & (cap-1);
+      }
+    }
+    iCur = valEnd;
+  }
+  sqlite3_free(htab); sqlite3_free(chain);
+  return 1;
+}
+
+/* Single linear pass over an array root at offset 0, resolving every "simple"
+** index path.  Uses a direct index table (idx -> chain of paths) which is much
+** cheaper than hashing for the dense small indices typical of a property bag.
+** Falls back (returns 0) if the largest requested index is too large to index
+** compactly, or on OOM/malformed input. Semantics mirror mpScanMap(). */
+static int mpScanArray(const u8 *a, u32 n,
+                       const MpPath *paths, int nPath,
+                       u32 *aStart, u32 *aEnd, u8 *aFound){
+  u8 b = a[0];
+  u32 count, elemOff, cur, iCur;
+  int r, remaining = 0;
+  i64 maxIdx = -1;
+  int *slot, *chain, i;
+  if( b>=0x90 && b<=0x9f ){ count = b & 0x0f;         elemOff = 1; }
+  else if( b==MP_ARRAY16 ){ if(3>n) return 0; count = mpRead16(a+1); elemOff = 3; }
+  else if( b==MP_ARRAY32 ){ if(5>n) return 0; count = mpRead32(a+1); elemOff = 5; }
+  else return 0;
+  for( r=0; r<nPath; r++ ){
+    aFound[r] = 0;
+    if( paths[r].kind=='i' && paths[r].idx>=0 && (u64)paths[r].idx<(u64)count ){
+      if( paths[r].idx>maxIdx ) maxIdx = paths[r].idx;
+      remaining++;
+    }
+  }
+  if( remaining==0 ) return 1;              /* nothing in range → all NIL */
+  /* Bound the direct-index table; if indices are too sparse, let the caller use
+  ** the original per-path loop instead of allocating a huge table. */
+  if( maxIdx+1 > (i64)(8*nPath + 1024) ) return 0;
+
+  slot  = (int*)sqlite3_malloc((int)(sizeof(int)*(maxIdx+1)));
+  chain = (int*)sqlite3_malloc((int)(sizeof(int)*nPath));
+  if( !slot || !chain ){ sqlite3_free(slot); sqlite3_free(chain); return 0; }
+  for( i=0; i<=(int)maxIdx; i++ ) slot[i] = -1;
+  for( r=0; r<nPath; r++ ){
+    chain[r] = -1;
+    if( paths[r].kind=='i' && paths[r].idx>=0 && paths[r].idx<=maxIdx ){
+      chain[r] = slot[paths[r].idx];   /* chain duplicate requests for same idx */
+      slot[paths[r].idx] = r;
+    }
+  }
+
+  iCur = elemOff;
+  for( cur=0; cur<count && remaining>0; cur++ ){
+    u32 elemStart = iCur, elemEnd;
+    if( iCur >= n ){ sqlite3_free(slot); sqlite3_free(chain); return 0; }
+    elemEnd = mpSkipOne(a, n, iCur);
+    if( !elemEnd ){ sqlite3_free(slot); sqlite3_free(chain); return 0; }
+    if( (i64)cur<=maxIdx && slot[cur]>=0 ){
+      int x;
+      for( x=slot[cur]; x!=-1; x=chain[x] ){
+        aStart[x]=elemStart; aEnd[x]=elemEnd; aFound[x]=1; remaining--;
+      }
+    }
+    iCur = elemEnd;
+  }
+  sqlite3_free(slot); sqlite3_free(chain);
+  return 1;
+}
+
+/* Implements msgpack_extract() for the multi-path (argc>2) case.
+**
+** For a container root with enough single-component paths the requested elements
+** are gathered in one linear pass (mpScanMap/mpScanArray).  Every other case —
+** few paths, non-container root, non-simple paths, or OOM — runs the original
+** per-path mpLookup() loop, byte-for-byte unchanged and with no extra
+** allocation, so it is never a regression. */
+static void mpExtractMulti(sqlite3_context *ctx, int argc, sqlite3_value **argv,
+                           const u8 *a, u32 n){
+  int nPath = argc - 1;
+  MpBuf buf;
+  u8 *result;
+  u32 nOut;
+  int r;
+
+  /* Accelerated single pass: only worthwhile with many paths on a container. */
+  if( n>0 && nPath>=MP_MULTI_HASH_MIN ){
+    u8 b = a[0];
+    int isMap   = (b>=0x80 && b<=0x8f) || b==MP_MAP16   || b==MP_MAP32;
+    int isArray = (b>=0x90 && b<=0x9f) || b==MP_ARRAY16 || b==MP_ARRAY32;
+    if( isMap || isArray ){
+      MpPath *paths = (MpPath*)sqlite3_malloc((int)(sizeof(MpPath) * nPath));
+      if( paths ){
+        int handled = 0, allSimple = 1;
+        for( r=0; r<nPath; r++ ){
+          mpPathParse(&paths[r], (const char*)sqlite3_value_text(argv[r+1]));
+          if( !paths[r].simple ) allSimple = 0;
+        }
+        if( allSimple ){
+          u32 *aStart = (u32*)sqlite3_malloc((int)(sizeof(u32)*nPath));
+          u32 *aEnd   = (u32*)sqlite3_malloc((int)(sizeof(u32)*nPath));
+          u8  *aFound = (u8*) sqlite3_malloc((int)nPath);
+          if( aStart && aEnd && aFound ){
+            handled = isMap ? mpScanMap  (a, n, paths, nPath, aStart, aEnd, aFound)
+                            : mpScanArray(a, n, paths, nPath, aStart, aEnd, aFound);
+            if( handled ){
+              mpBufInit(&buf, ctx);
+              mpEncodeArrayHeader(&buf, (u32)nPath);
+              for( r=0; r<nPath; r++ ){
+                if( aFound[r] ) mpBufAppend(&buf, a+aStart[r], aEnd[r]-aStart[r]);
+                else            mpBufAppend1(&buf, MP_NIL);
+              }
+              result = mpBufFinish(&buf, &nOut);
+              if( result ) sqlite3_result_blob(ctx, result, (int)nOut, sqlite3_free);
+            }
+          }
+          sqlite3_free(aStart); sqlite3_free(aEnd); sqlite3_free(aFound);
+        }
+        if( !handled ){
+          /* Non-simple paths or scan bailout: per-path loop over parsed paths. */
+          mpBufInit(&buf, ctx);
+          mpEncodeArrayHeader(&buf, (u32)nPath);
+          for( r=0; r<nPath; r++ ){
+            u32 iStart=0, iEnd=0;
+            if( paths[r].zPath
+             && mpLookup(a, n, 0, paths[r].zPath, &iStart, &iEnd)==SQLITE_OK )
+              mpBufAppend(&buf, a+iStart, iEnd-iStart);
+            else
+              mpBufAppend1(&buf, MP_NIL);
+          }
+          result = mpBufFinish(&buf, &nOut);
+          if( result ) sqlite3_result_blob(ctx, result, (int)nOut, sqlite3_free);
+        }
+        sqlite3_free(paths);
+        return;
+      }
+      /* paths[] allocation failed → fall through to the plain loop below. */
+    }
+  }
+
+  /* Plain per-path loop — identical to the original implementation (no path
+  ** compilation or extra allocation). Used for few paths, non-container roots,
+  ** or OOM. */
+  mpBufInit(&buf, ctx);
+  mpEncodeArrayHeader(&buf, (u32)nPath);
+  for( r=0; r<nPath; r++ ){
+    u32 iStart=0, iEnd=0;
+    const char *zPath = (const char*)sqlite3_value_text(argv[r+1]);
+    if( zPath && mpLookup(a, n, 0, zPath, &iStart, &iEnd)==SQLITE_OK )
+      mpBufAppend(&buf, a+iStart, iEnd-iStart);
+    else
+      mpBufAppend1(&buf, MP_NIL);
+  }
+  result = mpBufFinish(&buf, &nOut);
+  if( result ) sqlite3_result_blob(ctx, result, (int)nOut, sqlite3_free);
+}
+
+/*
 ** msgpack_extract(mp, path, ...) → value
 ** Single path: returns SQL-typed value for scalars, BLOB for containers.
 ** Multiple paths: returns a msgpack array of results (one per path).
@@ -2024,24 +2325,8 @@ static void msgpackExtractFunc(
       sqlite3_result_null(ctx);
     }
   } else {
-    /* Multiple paths → return msgpack array */
-    MpBuf buf;
-    u8 *result;
-    u32 nResult;
-    int i;
-    mpBufInit(&buf, ctx);
-    mpEncodeArrayHeader(&buf, (u32)(argc-1));
-    for( i=1; i<argc; i++ ){
-      const char *zPath = (const char*)sqlite3_value_text(argv[i]);
-      u32 iStart=0, iEnd=0;
-      if( mpLookup(a,n,0,zPath,&iStart,&iEnd)==SQLITE_OK ){
-        mpBufAppend(&buf, a+iStart, iEnd-iStart);
-      } else {
-        mpBufAppend1(&buf, MP_NIL);
-      }
-    }
-    result = mpBufFinish(&buf, &nResult);
-    if( result ) sqlite3_result_blob(ctx, result, (int)nResult, sqlite3_free);
+    /* Multiple paths → return msgpack array (single-pass when possible). */
+    mpExtractMulti(ctx, argc, argv, a, n);
   }
 }
 

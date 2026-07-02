@@ -520,6 +520,97 @@ static void test_extract_column_types(sqlite3 *db){
   sqlite3_free(buf);
 }
 
+/*---------------------------------------------------------------------------------------
+** Phase 4.11: multi-path msgpack_extract() single-pass fast path.
+** A call with >= 16 single-component paths on a container root gathers all requested
+** elements in one linear walk; the result must equal per-path resolution (including
+** duplicate paths, missing keys/out-of-range indices -> NIL), a non-simple path must fall
+** back correctly, and a malformed STR32 key length must not read out of bounds.
+**-------------------------------------------------------------------------------------*/
+static void test_extract_multipath(sqlite3 *db){
+  char obj[4096], me[4096], sql[4400];
+  int off, k, ok;
+
+  /* Wide map p0..p39 = i*7+3; extract a 16-path subset (dup + missing key). */
+  off = snprintf(obj, sizeof(obj), "msgpack_object(");
+  for(k=0;k<40;k++) off += snprintf(obj+off, sizeof(obj)-off, "%s'p%d',%d", k?",":"", k, k*7+3);
+  snprintf(obj+off, sizeof(obj)-off, ")");
+
+  struct { const char *path; int slot; } reqs[] = {   /* slot < 0 => missing (NIL) */
+    {"$.p0",0},{"$.p39",39},{"$.p5",5},{"$.p39",39},{"$.nope",-1},{"$.p20",20},
+    {"$.p1",1},{"$.p38",38},{"$.p2",2},{"$.p37",37},{"$.p3",3},{"$.p36",36},
+    {"$.p4",4},{"$.p35",35},{"$.p6",6},{"$.p34",34}};
+  int K = (int)(sizeof(reqs)/sizeof(reqs[0]));
+  off = snprintf(me, sizeof(me), "msgpack_extract(%s", obj);
+  for(k=0;k<K;k++) off += snprintf(me+off, sizeof(me)-off, ",'%s'", reqs[k].path);
+  snprintf(me+off, sizeof(me)-off, ")");
+
+  snprintf(sql, sizeof(sql), "SELECT msgpack_array_length(%s)", me);
+  CHECK("11.1 multi-path map: length == K", exec1i(db, sql) == K);
+  ok = 1;
+  for(k=0;k<K;k++){
+    if(reqs[k].slot < 0){
+      snprintf(sql, sizeof(sql), "SELECT msgpack_extract(%s,'$[%d]') IS NULL", me, k);
+      if(exec1i(db, sql) != 1) ok = 0;
+    } else {
+      snprintf(sql, sizeof(sql), "SELECT msgpack_extract(%s,'$[%d]')", me, k);
+      if(exec1i(db, sql) != (sqlite3_int64)(reqs[k].slot*7+3)) ok = 0;
+    }
+  }
+  CHECK("11.2 multi-path map: every element == per-path result", ok);
+
+  /* Array root: 18 index paths incl. duplicate + out-of-range. */
+  off = snprintf(obj, sizeof(obj), "msgpack_array(");
+  for(k=0;k<40;k++) off += snprintf(obj+off, sizeof(obj)-off, "%s%d", k?",":"", k*3+1);
+  snprintf(obj+off, sizeof(obj)-off, ")");
+  int idxs[] = {0,39,5,39,100,20,1,38,2,37,3,36,4,35,6,34,7,33};
+  int KA = (int)(sizeof(idxs)/sizeof(idxs[0]));
+  off = snprintf(me, sizeof(me), "msgpack_extract(%s", obj);
+  for(k=0;k<KA;k++) off += snprintf(me+off, sizeof(me)-off, ",'$[%d]'", idxs[k]);
+  snprintf(me+off, sizeof(me)-off, ")");
+  snprintf(sql, sizeof(sql), "SELECT msgpack_array_length(%s)", me);
+  CHECK("11.3 multi-path array: length == K", exec1i(db, sql) == KA);
+  ok = 1;
+  for(k=0;k<KA;k++){
+    if(idxs[k] >= 40){
+      snprintf(sql, sizeof(sql), "SELECT msgpack_extract(%s,'$[%d]') IS NULL", me, k);
+      if(exec1i(db, sql) != 1) ok = 0;
+    } else {
+      snprintf(sql, sizeof(sql), "SELECT msgpack_extract(%s,'$[%d]')", me, k);
+      if(exec1i(db, sql) != (sqlite3_int64)(idxs[k]*3+1)) ok = 0;
+    }
+  }
+  CHECK("11.4 multi-path array: every element == per-path result", ok);
+
+  /* A nested path among >= 16 paths forces the per-path fallback; still correct. */
+  off = snprintf(obj, sizeof(obj), "msgpack_object(");
+  for(k=0;k<20;k++){
+    if(k==3) off += snprintf(obj+off, sizeof(obj)-off, "%s'p3',msgpack_object('x',77)", k?",":"");
+    else     off += snprintf(obj+off, sizeof(obj)-off, "%s'p%d',%d", k?",":"", k, k+100);
+  }
+  snprintf(obj+off, sizeof(obj)-off, ")");
+  off = snprintf(me, sizeof(me), "msgpack_extract(%s,'$.p0','$.p3.x'", obj);
+  for(k=1;k<20;k++) if(k!=3) off += snprintf(me+off, sizeof(me)-off, ",'$.p%d'", k);
+  snprintf(me+off, sizeof(me)-off, ")");
+  snprintf(sql, sizeof(sql), "SELECT msgpack_extract(%s,'$[0]')", me);
+  CHECK("11.5 fallback (nested path): simple key correct", exec1i(db, sql) == 100);
+  snprintf(sql, sizeof(sql), "SELECT msgpack_extract(%s,'$[1]')", me);
+  CHECK("11.6 fallback (nested path): nested value correct", exec1i(db, sql) == 77);
+
+  /* Malformed STR32 map key (declared length 0xFFFFFFFF) must not read OOB. */
+  off = snprintf(me, sizeof(me), "msgpack_extract(x'81dbffffffff'");
+  for(k=0;k<16;k++) off += snprintf(me+off, sizeof(me)-off, ",'$.k%d'", k);
+  snprintf(me+off, sizeof(me)-off, ")");
+  snprintf(sql, sizeof(sql), "SELECT msgpack_array_length(%s)", me);
+  CHECK("11.7 malformed STR32 key: safe, length == 16", exec1i(db, sql) == 16);
+  ok = 1;
+  for(k=0;k<16;k++){
+    snprintf(sql, sizeof(sql), "SELECT msgpack_extract(%s,'$[%d]') IS NULL", me, k);
+    if(exec1i(db, sql) != 1) ok = 0;
+  }
+  CHECK("11.8 malformed STR32 key: all elements NIL", ok);
+}
+
 int main(void){
   sqlite3 *db = NULL;
   if(sqlite3_open(":memory:", &db) != SQLITE_OK){ fprintf(stderr,"open failed\n"); return 1; }
@@ -536,6 +627,7 @@ int main(void){
   test_array_length(db);
   test_error_position(db);
   test_extract_column_types(db);
+  test_extract_multipath(db);
 
   sqlite3_close(db);
   printf("\n%d passed, %d failed\n", g_pass, g_fail);
